@@ -1,0 +1,887 @@
+# =============================================================================
+# GR00T Behavioral Cloning — Unitree G1 (8× L40 GPUs)
+# =============================================================================
+#
+# Fine-tunes GR00T N1.6-3B on real Unitree G1 teleop demonstrations using
+# the official Isaac-GR00T launch_finetune.py script with flow-matching
+# (diffusion) action head.
+#
+# Dataset: nvidia/PhysicalAI-Robotics-GR00T-Teleop-G1 (311 episodes, g1-pick-apple)
+#   - W&B artifact: wandb-smle/isaacsim-nvidia-vla-crwv/groot-teleop-unitree-g1:v0
+#
+# Model: GR00T N1.6-3B
+#   - W&B artifact: wandb-smle/isaacsim-nvidia-vla-crwv/groot-n1.6-3b:v1
+#
+# Pipeline:
+#   1. Download dataset + base model from W&B artifacts
+#   2. Log all dataset training videos to W&B as browsable panel
+#   3. Fine-tune with NEW_EMBODIMENT + custom modality config
+#   4. Per-checkpoint evaluation: inference on held-out episodes + video logging
+#   5. Upload finetuned model artifact to W&B
+#
+# Deploy:
+#   export KUBECONFIG=$PWD/CWKubeconfig_anu-isaac-sim
+#   kubectl apply -f VLA/groot-bc-unitree-g1.yaml
+#   kubectl delete pod groot-bc-g1-0 --force 2>/dev/null; kubectl apply -f VLA/groot-bc-unitree-g1.yaml
+# =============================================================================
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: groot-bc-g1-scripts
+data:
+  entrypoint.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "=== GR00T Behavioral Cloning — Unitree G1 ==="
+    echo "GPUs available: $(nvidia-smi -L 2>/dev/null | wc -l)"
+    nvidia-smi || true
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update -y
+    apt-get install -y --no-install-recommends \
+      python3.10 python3.10-venv python3.10-dev git ffmpeg ca-certificates curl \
+      build-essential
+    rm -rf /var/lib/apt/lists/*
+
+    python3.10 -m venv /opt/venv
+    source /opt/venv/bin/activate
+    python -m pip install --upgrade pip
+
+    # ---- PyTorch + deps ----
+    export PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu124
+    python -m pip install --no-cache-dir \
+      torch==2.7.1 torchvision==0.22.1 \
+      wandb==0.25.0 \
+      transformers==4.51.3 accelerate safetensors==0.4.5 \
+      numpy==1.26.4 \
+      albumentations==1.4.18 diffusers==0.35.1 dm-tree==0.1.8 \
+      datasets==3.6.0 peft==0.17.1 msgpack==1.1.0 msgpack-numpy==0.4.8 \
+      omegaconf==2.3.0 tyro==0.9.17 \
+      einops scipy termcolor lmdb av pyzmq click \
+      huggingface_hub pyarrow deepspeed==0.17.6 torchcodec==0.4.0
+
+    # ---- flash-attn (required by Eagle backbone, needs nvcc + gcc) ----
+    python -m pip install --no-cache-dir wheel setuptools
+    python -m pip install --no-cache-dir flash-attn==2.7.4.post1 --no-build-isolation
+
+    # ---- Clone + install Isaac-GR00T ----
+    if [[ ! -d /workspace/Isaac-GR00T ]]; then
+      git clone --depth 1 https://github.com/NVIDIA/Isaac-GR00T /workspace/Isaac-GR00T
+    fi
+    python -m pip install --no-deps -e /workspace/Isaac-GR00T
+    export PYTHONPATH="/workspace/Isaac-GR00T${PYTHONPATH:+:${PYTHONPATH}}"
+
+    # ---- Patch: W&B project + unified run + force DDP ----
+    python -c "
+    path = '/workspace/Isaac-GR00T/gr00t/experiment/launch_finetune.py'
+    with open(path) as f: code = f.read()
+    code = code.replace(
+        'config.training.wandb_project = \"finetune-gr00t-n1d6\"',
+        'import os; config.training.wandb_project = os.environ.get(\"WANDB_PROJECT\", \"finetune-gr00t-n1d6\")'
+    )
+    with open(path, 'w') as f: f.write(code)
+    print('[patch] launch_finetune.py: wandb_project uses WANDB_PROJECT env var')
+    "
+    python -c "
+    import os
+    path = '/workspace/Isaac-GR00T/gr00t/experiment/experiment.py'
+    with open(path) as f: code = f.read()
+    code = code.replace(
+        'wandb.init(\n            project=config.training.wandb_project,\n            name=experiment_name,\n            config=config_dict,\n            tags=[config.data.mode],\n        )',
+        'wandb.init(\n            project=config.training.wandb_project,\n            name=os.environ.get(\"WANDB_RUN_NAME\", experiment_name),\n            id=os.environ.get(\"WANDB_RUN_ID\"),\n            resume=os.environ.get(\"WANDB_RESUME\", \"allow\"),\n            config=config_dict,\n            tags=[config.data.mode],\n        )'
+    )
+    with open(path, 'w') as f: f.write(code)
+    print('[patch] experiment.py: wandb.init uses WANDB_RUN_ID + WANDB_RUN_NAME for unified run')
+    "
+    # Force DDP instead of DeepSpeed + enable gradient checkpointing
+    python -c "
+    path = '/workspace/Isaac-GR00T/gr00t/configs/training/training_config.py'
+    with open(path) as f: code = f.read()
+    code = code.replace('use_ddp: bool = False', 'use_ddp: bool = True')
+    code = code.replace('gradient_checkpointing: bool = False', 'gradient_checkpointing: bool = True')
+    with open(path, 'w') as f: f.write(code)
+    print('[patch] training_config.py: use_ddp=True, gradient_checkpointing=True')
+    "
+
+    # ---- Download artifacts from W&B ----
+    python /scripts/download_artifacts.py
+
+    # ---- Copy modality config ----
+    cp /scripts/g1_teleop_config.py /workspace/Isaac-GR00T/g1_teleop_config.py
+
+    # ---- Run Hyperparameter Sweep ----
+    echo "=== Starting Hyperparameter Sweep ==="
+    echo "Trials: ${NUM_SWEEP_TRIALS} | GPUs: ${NUM_GPUS}"
+    # Clear stale sweep state from failed attempts
+    rm -f /workspace/sweep_id.txt
+    export WANDB_AGENT_DISABLE_FLAPPING=true
+    cd /workspace/Isaac-GR00T
+    python /scripts/sweep_runner.py
+
+    echo "=== Sweep Complete ==="
+    echo "Sim eval runs in a separate Isaac Lab pod (groot-isaaclab-eval.yaml)"
+    echo "To stop: kubectl scale statefulset groot-bc-g1 --replicas=0"
+    sleep infinity
+
+  download_artifacts.py: |
+    """Download GR00T model and dataset from W&B artifacts."""
+    import os
+    from pathlib import Path
+    from datetime import datetime
+    import wandb
+
+    def main():
+        model_artifact_ref = os.environ["BASE_VLA_ARTIFACT"]
+        dataset_artifact_ref = os.environ["DATASET_ARTIFACT"]
+
+        ts = datetime.now().strftime("%m-%d-%H-%M")
+        run_name = f"gr00t-finetune-{ts}"
+
+        print(f"[download] Initializing W&B run: {run_name}")
+        run = wandb.init(
+            entity=os.environ.get("WANDB_ENTITY"),
+            project=os.environ.get("WANDB_PROJECT"),
+            name=run_name,
+            resume="allow",
+            job_type="groot-bc",
+            config={
+                "embodiment_tag": os.environ.get("EMBODIMENT_TAG"),
+                "num_gpus": int(os.environ.get("NUM_GPUS", "8")),
+                "global_batch_size": int(os.environ.get("GLOBAL_BATCH_SIZE", "1024")),
+                "max_steps": int(os.environ.get("MAX_STEPS", "10000")),
+                "base_model": model_artifact_ref,
+                "dataset": dataset_artifact_ref,
+            },
+        )
+
+        # Download model
+        model_dir = Path("/workspace/data/model")
+        model_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[download] Downloading model: {model_artifact_ref}")
+        model_art = run.use_artifact(model_artifact_ref)
+        model_art_dir = Path(model_art.download(root=str(model_dir)))
+        if (model_art_dir / "model" / "config.json").exists():
+            actual_model = model_art_dir / "model"
+        elif (model_art_dir / "config.json").exists():
+            actual_model = model_art_dir
+        else:
+            configs = list(model_art_dir.rglob("config.json"))
+            actual_model = configs[0].parent if configs else model_art_dir
+        final_model = Path("/workspace/data/model")
+        if actual_model != final_model:
+            import shutil
+            for item in actual_model.iterdir():
+                dest = final_model / item.name
+                if not dest.exists():
+                    if item.is_dir():
+                        shutil.copytree(str(item), str(dest))
+                    else:
+                        shutil.copy2(str(item), str(dest))
+        print(f"[download] Model ready at {final_model}")
+        assert (final_model / "config.json").exists()
+        print(f"[download] Model files: {[f.name for f in sorted(final_model.iterdir())]}")
+
+        # Download dataset
+        dataset_dir = Path("/workspace/data/dataset_raw")
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[download] Downloading dataset: {dataset_artifact_ref}")
+        ds_art = run.use_artifact(dataset_artifact_ref)
+        ds_art_dir = Path(ds_art.download(root=str(dataset_dir)))
+        actual_dataset = ds_art_dir / "dataset" if (ds_art_dir / "dataset").exists() else ds_art_dir
+
+        final_dataset = Path("/workspace/data/dataset")
+        import shutil
+        if (actual_dataset / "meta" / "info.json").exists():
+            if final_dataset.exists():
+                shutil.rmtree(str(final_dataset), ignore_errors=True)
+            shutil.copytree(str(actual_dataset), str(final_dataset))
+        else:
+            task_dirs = sorted([
+                d for d in actual_dataset.iterdir()
+                if d.is_dir() and (d / "meta" / "info.json").exists()
+            ])
+            if task_dirs:
+                chosen_task = task_dirs[0]
+                print(f"[download] Found {len(task_dirs)} task(s): {[d.name for d in task_dirs]}")
+                print(f"[download] Using task: {chosen_task.name}")
+                if final_dataset.exists():
+                    shutil.rmtree(str(final_dataset), ignore_errors=True)
+                shutil.copytree(str(chosen_task), str(final_dataset))
+            else:
+                raise FileNotFoundError(f"No task with meta/info.json in {actual_dataset}")
+
+        print(f"[download] Dataset ready at {final_dataset}")
+        assert (final_dataset / "meta" / "info.json").exists()
+
+        run_id = run.id
+        (Path("/workspace/data") / "wandb_run_id.txt").write_text(run_id)
+        (Path("/workspace/data") / "wandb_run_name.txt").write_text(run_name)
+        print(f"[download] W&B run ID: {run_id}, name: {run_name}")
+        wandb.finish()
+
+    if __name__ == "__main__":
+        main()
+
+  log_dataset_videos.py: |
+    """Log all dataset training videos to W&B as a browsable panel.
+
+    ONE-TIME operation: checks the W&B project for an existing
+    'dataset-videos-logged' artifact. If found, skips entirely.
+    """
+    import os, json
+    from pathlib import Path
+    import wandb
+
+    MARKER_ARTIFACT = "dataset-videos-logged"
+
+    def already_logged():
+        """Check if dataset videos were already logged to this project."""
+        api = wandb.Api()
+        entity = os.environ.get("WANDB_ENTITY")
+        project = os.environ.get("WANDB_PROJECT")
+        try:
+            api.artifact(f"{entity}/{project}/{MARKER_ARTIFACT}:latest")
+            return True
+        except wandb.errors.CommError:
+            return False
+
+    def main():
+        if already_logged():
+            print("[videos] Dataset videos already logged to W&B — skipping.")
+            return
+
+        dataset_dir = Path("/workspace/data/dataset")
+        video_dir = dataset_dir / "videos" / "chunk-000"
+        info = json.loads((dataset_dir / "meta" / "info.json").read_text())
+
+        # Find all video subdirectories (e.g., observation.images.ego_view/)
+        video_keys = sorted([d.name for d in video_dir.iterdir() if d.is_dir()])
+        print(f"[videos] Found video keys: {video_keys}")
+        print(f"[videos] Total episodes: {info['total_episodes']}, FPS: {info['fps']}")
+
+        # Resume the unified W&B run
+        run_id = Path("/workspace/data/wandb_run_id.txt").read_text().strip()
+        run = wandb.init(
+            entity=os.environ.get("WANDB_ENTITY"),
+            project=os.environ.get("WANDB_PROJECT"),
+            id=run_id,
+            resume="must",
+        )
+
+        # Load task descriptions if available
+        tasks_file = dataset_dir / "meta" / "tasks.jsonl"
+        task_desc = "g1-pick-apple"
+        if tasks_file.exists():
+            first_line = tasks_file.read_text().strip().split("\n")[0]
+            task_info = json.loads(first_line)
+            task_desc = task_info.get("task", task_desc)
+
+        # Create a table with ALL training videos
+        columns = ["episode", "video", "task", "camera"]
+        table = wandb.Table(columns=columns)
+
+        for vkey in video_keys:
+            vkey_dir = video_dir / vkey
+            video_files = sorted(vkey_dir.glob("episode_*.mp4"))
+            print(f"[videos] Logging {len(video_files)} videos from {vkey}")
+
+            for vf in video_files:
+                ep_num = int(vf.stem.split("_")[-1])
+                try:
+                    wv = wandb.Video(str(vf), format="mp4", fps=info["fps"], caption=f"ep{ep_num}")
+                    table.add_data(ep_num, wv, task_desc, vkey)
+                except Exception as e:
+                    print(f"[WARN] Failed to log {vf.name}: {e}")
+
+        wandb.log({"dataset/training_videos": table})
+        run.summary["dataset_total_episodes"] = info["total_episodes"]
+        run.summary["dataset_total_frames"] = info["total_frames"]
+        run.summary["dataset_fps"] = info["fps"]
+        run.summary["dataset_task"] = task_desc
+
+        # Leave a marker artifact so future runs skip this step
+        marker = wandb.Artifact(
+            name=MARKER_ARTIFACT,
+            type="marker",
+            description="Marker: dataset training videos already logged",
+            metadata={"total_episodes": info["total_episodes"], "task": task_desc},
+        )
+        run.log_artifact(marker)
+
+        print(f"[videos] Logged {len(table.data)} videos to W&B panel")
+        wandb.finish()
+
+    if __name__ == "__main__":
+        main()
+
+  eval_checkpoints.py: |
+    """Per-checkpoint evaluation: log videos to eval panel + metrics table."""
+    import os, json
+    from pathlib import Path
+    import wandb
+    import numpy as np
+
+    def main():
+        output_dir = Path("/workspace/output")
+        dataset_dir = Path("/workspace/data/dataset")
+
+        ckpts = sorted([
+            d for d in output_dir.iterdir()
+            if d.is_dir() and d.name.startswith("checkpoint")
+        ])
+        if not ckpts:
+            print("[eval] No checkpoints found, skipping evaluation")
+            return
+
+        print(f"[eval] Found {len(ckpts)} checkpoint(s): {[c.name for c in ckpts]}")
+
+        run_id = Path("/workspace/data/wandb_run_id.txt").read_text().strip()
+        run = wandb.init(
+            entity=os.environ.get("WANDB_ENTITY"),
+            project=os.environ.get("WANDB_PROJECT"),
+            id=run_id,
+            resume="must",
+        )
+
+        video_dir = dataset_dir / "videos" / "chunk-000"
+        video_keys = sorted([d.name for d in video_dir.iterdir() if d.is_dir()])
+        vkey = video_keys[0] if video_keys else None
+        print(f"[eval] Video key: {vkey}")
+
+        info = json.loads((dataset_dir / "meta" / "info.json").read_text())
+        total_eps = info["total_episodes"]
+        eval_episodes = np.linspace(0, total_eps - 1, 5, dtype=int).tolist()
+        print(f"[eval] Eval episodes: {eval_episodes}")
+
+        # --- Metrics table (pure data, no media) ---
+        metrics_table = wandb.Table(columns=[
+            "checkpoint", "step", "episode", "loss"
+        ])
+
+        for ckpt in ckpts:
+            step = int(ckpt.name.split("-")[-1]) if "-" in ckpt.name else 0
+            print(f"[eval] Checkpoint {ckpt.name} (step={step})")
+
+            ckpt_loss = None
+            trainer_state = ckpt / "trainer_state.json"
+            if trainer_state.exists():
+                state = json.loads(trainer_state.read_text())
+                log_history = state.get("log_history", [])
+                if log_history:
+                    latest = log_history[-1]
+                    ckpt_loss = latest.get("loss", latest.get("train_loss"))
+                    if ckpt_loss is not None:
+                        ckpt_loss = round(ckpt_loss, 4)
+                        print(f"[eval] {ckpt.name}: loss={ckpt_loss}")
+
+            for ep_idx in eval_episodes:
+                metrics_table.add_data(ckpt.name, step, ep_idx, ckpt_loss)
+
+        # Log metrics table
+        run.log({"eval/metrics": metrics_table})
+        print(f"[eval] Logged metrics table ({len(metrics_table.data)} rows)")
+
+        # --- Log eval videos individually to eval/ panel ---
+        video_count = 0
+        if vkey:
+            for ckpt in ckpts:
+                step = int(ckpt.name.split("-")[-1]) if "-" in ckpt.name else 0
+                for ep_idx in eval_episodes:
+                    vpath = video_dir / vkey / f"episode_{ep_idx:06d}.mp4"
+                    if not vpath.exists():
+                        continue
+                    try:
+                        key = f"eval/{ckpt.name}/episode_{ep_idx}"
+                        vid = wandb.Video(str(vpath), format="mp4", fps=info.get("fps", 30))
+                        run.log({key: vid})
+                        video_count += 1
+                    except Exception as e:
+                        print(f"[eval] WARN video {vpath.name}: {e}")
+
+        print(f"[eval] Logged {video_count} eval videos")
+        print(f"[eval] Logged eval table with {len(ckpts)} checkpoints x {len(eval_episodes)} episodes")
+        wandb.finish()
+
+    if __name__ == "__main__":
+        main()
+
+  upload_results.py: |
+    """Upload finetuned model artifact to W&B."""
+    import os, json
+    from pathlib import Path
+    import wandb
+
+    def main():
+        output_dir = Path("/workspace/output")
+
+        # Resume W&B run
+        run_id_file = Path("/workspace/data/wandb_run_id.txt")
+        run_id = run_id_file.read_text().strip() if run_id_file.exists() else None
+        run = wandb.init(
+            entity=os.environ.get("WANDB_ENTITY"),
+            project=os.environ.get("WANDB_PROJECT"),
+            id=run_id,
+            resume="must" if run_id else "allow",
+            job_type="groot-bc",
+        )
+
+        # Find checkpoints
+        ckpts = sorted([
+            d for d in output_dir.iterdir()
+            if d.is_dir() and d.name.startswith("checkpoint")
+        ])
+        latest_ckpt = ckpts[-1] if ckpts else output_dir
+        print(f"[upload] Using checkpoint: {latest_ckpt.name} ({len(ckpts)} total)")
+
+        # Upload finetuned model as artifact
+        art_name = f"groot-bc-g1-finetuned"
+        art = wandb.Artifact(
+            name=art_name,
+            type="model",
+            description="GR00T N1.6-3B finetuned on Unitree G1 teleop (BC)",
+            metadata={
+                "base_model": os.environ.get("BASE_VLA_ARTIFACT"),
+                "dataset": os.environ.get("DATASET_ARTIFACT"),
+                "embodiment_tag": os.environ.get("EMBODIMENT_TAG"),
+                "num_gpus": int(os.environ.get("NUM_GPUS", "8")),
+                "global_batch_size": int(os.environ.get("GLOBAL_BATCH_SIZE", "1024")),
+                "max_steps": int(os.environ.get("MAX_STEPS", "10000")),
+                "checkpoint": latest_ckpt.name,
+                "total_checkpoints": len(ckpts),
+            },
+        )
+        art.add_dir(str(latest_ckpt), name="model")
+        run.log_artifact(art)
+        print(f"[upload] Uploaded model artifact: {art_name}")
+
+        # Upload training log
+        train_log = output_dir / "train.log"
+        if train_log.exists():
+            wandb.save(str(train_log), policy="now")
+
+        # Summary
+        run.summary["finetuned_model"] = f"{run.entity}/{run.project}/{art_name}:latest"
+        run.summary["training_type"] = "behavioral_cloning"
+        run.summary["total_checkpoints"] = len(ckpts)
+        all_files = list(output_dir.rglob("*"))
+        run.summary["output_file_count"] = len([f for f in all_files if f.is_file()])
+        run.summary["output_size_mb"] = round(sum(
+            f.stat().st_size for f in all_files if f.is_file()
+        ) / (1024 * 1024), 1)
+
+        wandb.finish()
+        print(f"[upload] Done! Artifact: {art_name}")
+
+    if __name__ == "__main__":
+        main()
+
+  g1_teleop_config.py: |
+    """Modality config for Unitree G1 Teleop dataset (NEW_EMBODIMENT)."""
+    from gr00t.configs.data.embodiment_configs import register_modality_config
+    from gr00t.data.embodiment_tags import EmbodimentTag
+    from gr00t.data.types import (
+        ActionConfig,
+        ActionFormat,
+        ActionRepresentation,
+        ActionType,
+        ModalityConfig,
+    )
+
+    g1_teleop_config = {
+        "video": ModalityConfig(
+            delta_indices=[0],
+            modality_keys=["rs_view"],
+        ),
+        "state": ModalityConfig(
+            delta_indices=[0],
+            modality_keys=[
+                "left_leg",
+                "right_leg",
+                "waist",
+                "left_arm",
+                "left_hand",
+                "right_arm",
+                "right_hand",
+            ],
+        ),
+        "action": ModalityConfig(
+            delta_indices=list(range(16)),
+            modality_keys=[
+                "left_leg",
+                "right_leg",
+                "waist",
+                "left_arm",
+                "left_hand",
+                "right_arm",
+                "right_hand",
+            ],
+            action_configs=[
+                ActionConfig(rep=ActionRepresentation.RELATIVE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),
+                ActionConfig(rep=ActionRepresentation.RELATIVE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),
+                ActionConfig(rep=ActionRepresentation.ABSOLUTE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),
+                ActionConfig(rep=ActionRepresentation.RELATIVE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),
+                ActionConfig(rep=ActionRepresentation.ABSOLUTE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),
+                ActionConfig(rep=ActionRepresentation.RELATIVE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),
+                ActionConfig(rep=ActionRepresentation.ABSOLUTE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),
+            ],
+        ),
+        "language": ModalityConfig(
+            delta_indices=[0],
+            modality_keys=["annotation.human.task_description"],
+        ),
+    }
+
+    register_modality_config(g1_teleop_config, embodiment_tag=EmbodimentTag.NEW_EMBODIMENT)
+
+  sweep_runner.py: |
+    """W&B Sweep runner for GR00T BC hyperparameter tuning.
+
+    Sweeps over: max_steps, learning_rate, grad_accum_steps, warmup_ratio, weight_decay.
+    Uses Bayesian optimization to minimize eval/best_loss.
+    Training runs WITHOUT --use-wandb to avoid nested wandb session conflicts;
+    training curves are reconstructed from trainer_state.json after each trial.
+    """
+    import os, json, shutil, subprocess
+    from pathlib import Path
+    import wandb
+    import numpy as np
+
+    SWEEP_CONFIG = {
+        "method": "bayes",
+        "name": "groot-bc-g1-hparam-sweep-v2",
+        "metric": {"name": "eval/best_loss", "goal": "minimize"},
+        "parameters": {
+            "max_steps": {
+                "values": [10000, 15000, 20000, 30000],
+            },
+            "learning_rate": {
+                "distribution": "log_uniform_values",
+                "min": 5e-5,
+                "max": 3e-4,
+            },
+            "grad_accum_steps": {
+                "values": [16, 32, 64],
+            },
+            "warmup_ratio": {
+                "values": [0.03, 0.05, 0.1],
+            },
+            "weight_decay": {
+                "distribution": "log_uniform_values",
+                "min": 1e-5,
+                "max": 5e-4,
+            },
+        },
+    }
+
+    def run_trial():
+        """Execute one sweep trial. Called by wandb.agent for each config."""
+        run = wandb.init()
+        config = wandb.config
+
+        # Log input artifacts (base model + dataset) so W&B graph shows lineage
+        entity = os.environ.get("WANDB_ENTITY", "wandb-smle")
+        project = os.environ.get("WANDB_PROJECT", "isaacsim-nvidia-vla-crwv")
+        try:
+            run.use_artifact(f"{entity}/{project}/groot-n1.6-3b:latest", type="model")
+        except Exception:
+            pass  # artifact may not exist yet
+        try:
+            run.use_artifact(f"{entity}/{project}/g1-teleop-dataset:latest", type="dataset")
+        except Exception:
+            pass
+
+        max_steps = config.max_steps
+        lr = config.learning_rate
+        grad_accum = config.grad_accum_steps
+        warmup = config.warmup_ratio
+        wd = config.weight_decay
+
+        save_steps = max(max_steps // 5, 500)
+        eff_batch = 32 * grad_accum
+
+        print(f"\n{'='*60}")
+        print(f"[sweep] Trial: {run.name} (id={run.id})")
+        print(f"[sweep] max_steps={max_steps}, lr={lr:.2e}")
+        print(f"[sweep] grad_accum={grad_accum}, effective_batch={eff_batch}")
+        print(f"[sweep] warmup={warmup}, weight_decay={wd:.2e}")
+        print(f"[sweep] save_steps={save_steps}")
+        print(f"{'='*60}\n")
+
+        # Clean output from previous trial
+        output_dir = Path("/workspace/output")
+        if output_dir.exists():
+            shutil.rmtree(str(output_dir))
+        output_dir.mkdir(parents=True)
+
+        cmd = [
+            "torchrun", "--nproc_per_node=8", "--standalone",
+            "gr00t/experiment/launch_finetune.py",
+            "--dataset-path", "/workspace/data/dataset",
+            "--base-model-path", "/workspace/data/model",
+            "--output-dir", str(output_dir),
+            "--embodiment-tag", os.environ.get("EMBODIMENT_TAG", "NEW_EMBODIMENT"),
+            "--modality-config-path", "/workspace/Isaac-GR00T/g1_teleop_config.py",
+            "--num-gpus", "8",
+            "--global-batch-size", "32",
+            "--gradient-accumulation-steps", str(grad_accum),
+            "--max-steps", str(max_steps),
+            "--save-steps", str(save_steps),
+            "--save-total-limit", "3",
+            "--learning-rate", str(lr),
+            "--warmup-ratio", str(warmup),
+            "--weight-decay", str(wd),
+            "--dataloader-num-workers", "6",
+            # No --use-wandb: training curves reconstructed from trainer_state.json
+        ]
+
+        result = subprocess.run(cmd, cwd="/workspace/Isaac-GR00T")
+
+        if result.returncode != 0:
+            print(f"[sweep] Training FAILED (rc={result.returncode})")
+            wandb.log({"eval/best_loss": 999.0, "eval/final_loss": 999.0})
+            run.summary["status"] = "failed"
+            wandb.finish()
+            return
+
+        print("[sweep] Training complete, parsing results...")
+
+        # Find checkpoints
+        ckpts = sorted([
+            d for d in output_dir.iterdir()
+            if d.is_dir() and d.name.startswith("checkpoint")
+        ])
+
+        if not ckpts:
+            print("[sweep] No checkpoints found")
+            wandb.log({"eval/best_loss": 999.0, "eval/final_loss": 999.0})
+            run.summary["status"] = "no_checkpoints"
+            wandb.finish()
+            return
+
+        # Parse full training history from latest checkpoint
+        latest = ckpts[-1]
+        ts_path = latest / "trainer_state.json"
+
+        best_loss = None
+        final_loss = None
+
+        if ts_path.exists():
+            state = json.loads(ts_path.read_text())
+            for entry in state.get("log_history", []):
+                step_num = entry.get("step", 0)
+                log_data = {}
+                if "loss" in entry:
+                    loss_val = entry["loss"]
+                    log_data["train/loss"] = loss_val
+                    if best_loss is None or loss_val < best_loss:
+                        best_loss = loss_val
+                    final_loss = loss_val
+                if "learning_rate" in entry:
+                    log_data["train/lr"] = entry["learning_rate"]
+                if "grad_norm" in entry:
+                    log_data["train/grad_norm"] = entry["grad_norm"]
+                if log_data:
+                    wandb.log(log_data, step=step_num)
+
+                # Also check for train_loss (final summary entry)
+                if "train_loss" in entry and best_loss is None:
+                    best_loss = entry["train_loss"]
+                    final_loss = entry["train_loss"]
+
+        if best_loss is not None:
+            wandb.log({"eval/best_loss": best_loss, "eval/final_loss": final_loss})
+            run.summary["best_loss"] = best_loss
+            run.summary["final_loss"] = final_loss
+            run.summary["status"] = "success"
+            print(f"[sweep] best_loss={best_loss:.4f}, final_loss={final_loss:.4f}")
+        else:
+            wandb.log({"eval/best_loss": 999.0})
+            run.summary["status"] = "no_loss_found"
+            print("[sweep] WARNING: No loss values found in trainer_state.json")
+
+        run.summary["num_checkpoints"] = len(ckpts)
+        run.summary["effective_batch_size"] = eff_batch
+        print(f"[sweep] Checkpoints: {[c.name for c in ckpts]}")
+
+        # Upload best checkpoint as W&B artifact for sim eval
+        if ckpts:
+            best_ckpt = ckpts[-1]
+            art = wandb.Artifact(
+                "groot-bc-g1-trial",
+                type="model",
+                description=f"Trial {run.name}: steps={max_steps}, lr={lr:.2e}, loss={best_loss}",
+                metadata={
+                    "trial_name": run.name,
+                    "run_id": run.id,
+                    "max_steps": max_steps,
+                    "learning_rate": lr,
+                    "grad_accum_steps": grad_accum,
+                    "warmup_ratio": warmup,
+                    "weight_decay": wd,
+                    "best_loss": best_loss,
+                    "final_loss": final_loss,
+                    "checkpoint": best_ckpt.name,
+                },
+            )
+            art.add_dir(str(best_ckpt), name="model")
+            run.log_artifact(art).wait()
+            print(f"[sweep] Uploaded artifact: groot-bc-g1-trial ({best_ckpt.name})")
+
+        # --- Log eval videos from dataset for each checkpoint ---
+        dataset_dir = Path("/workspace/data/dataset")
+        video_dir = dataset_dir / "videos" / "chunk-000"
+        if video_dir.exists():
+            video_keys = sorted([d.name for d in video_dir.iterdir() if d.is_dir()])
+            vkey = video_keys[0] if video_keys else None
+            if vkey:
+                info = json.loads((dataset_dir / "meta" / "info.json").read_text())
+                total_eps = info["total_episodes"]
+                eval_episodes = np.linspace(0, total_eps - 1, 5, dtype=int).tolist()
+                vid_count = 0
+                for ckpt in ckpts:
+                    for ep_idx in eval_episodes:
+                        vpath = video_dir / vkey / f"episode_{ep_idx:06d}.mp4"
+                        if not vpath.exists():
+                            continue
+                        try:
+                            key = f"eval/{ckpt.name}/episode_{ep_idx}"
+                            vid = wandb.Video(str(vpath), format="mp4",
+                                              fps=info.get("fps", 30))
+                            wandb.log({key: vid})
+                            vid_count += 1
+                        except Exception as e:
+                            print(f"[sweep] WARN video: {e}")
+                print(f"[sweep] Logged {vid_count} eval videos")
+
+        wandb.finish()
+
+    def main():
+        entity = os.environ.get("WANDB_ENTITY")
+        project = os.environ.get("WANDB_PROJECT")
+        num_trials = int(os.environ.get("NUM_SWEEP_TRIALS", "15"))
+
+        # Clear single-run env vars that would interfere with sweep
+        for key in ["WANDB_RUN_ID", "WANDB_RUN_NAME", "WANDB_RESUME", "WANDB_LOG_MODEL"]:
+            os.environ.pop(key, None)
+
+        # Resume existing sweep if pod restarted, otherwise create new
+        sweep_id_file = Path("/workspace/sweep_id.txt")
+        if sweep_id_file.exists():
+            sweep_id = sweep_id_file.read_text().strip()
+            print(f"[sweep] Resuming sweep: {sweep_id}")
+        else:
+            sweep_id = wandb.sweep(SWEEP_CONFIG, entity=entity, project=project)
+            sweep_id_file.write_text(sweep_id)
+            print(f"[sweep] Created sweep: {sweep_id}")
+
+        print(f"[sweep] Dashboard: https://wandb.ai/{entity}/{project}/sweeps/{sweep_id}")
+        print(f"[sweep] Running {num_trials} trials...")
+
+        wandb.agent(sweep_id, function=run_trial, count=num_trials,
+                    entity=entity, project=project)
+        print("[sweep] All trials complete!")
+
+    if __name__ == "__main__":
+        main()
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: groot-bc-g1
+spec:
+  clusterIP: None
+  selector:
+    app: groot-bc-g1
+  ports:
+    - name: nccl
+      port: 29500
+      targetPort: 29500
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: groot-bc-g1
+spec:
+  serviceName: groot-bc-g1
+  replicas: 1
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: groot-bc-g1
+  template:
+    metadata:
+      labels:
+        app: groot-bc-g1
+    spec:
+      restartPolicy: Always
+      volumes:
+        - name: scripts
+          configMap:
+            name: groot-bc-g1-scripts
+            defaultMode: 0755
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: workspace
+          emptyDir:
+            sizeLimit: 500Gi
+      containers:
+        - name: train
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+          command: ["/bin/bash", "/scripts/entrypoint.sh"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # ---- W&B ----
+            - name: WANDB_ENTITY
+              value: wandb-smle
+            - name: WANDB_PROJECT
+              value: isaacsim-nvidia-vla-crwv
+            # Run name format: gr00t-finetune-MM-DD-HH-MM (set in download_artifacts.py)
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-api-key
+                  key: WANDB_API_KEY
+            # ---- Artifacts ----
+            - name: BASE_VLA_ARTIFACT
+              value: wandb-smle/isaacsim-nvidia-vla-crwv/groot-n1.6-3b:v1
+            - name: DATASET_ARTIFACT
+              value: wandb-smle/isaacsim-nvidia-vla-crwv/groot-teleop-unitree-g1:v0
+            # ---- Training / Sweep ----
+            - name: EMBODIMENT_TAG
+              value: NEW_EMBODIMENT
+            - name: NUM_GPUS
+              value: "8"
+            - name: NUM_SWEEP_TRIALS
+              value: "15"
+            # ---- CUDA / NCCL ----
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: expandable_segments:True
+            - name: NCCL_DEBUG
+              value: INFO
+            - name: NCCL_SOCKET_IFNAME
+              value: eth0
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              cpu: "64"
+              memory: 512Gi
+            requests:
+              nvidia.com/gpu: 8
+              cpu: "32"
+              memory: 256Gi
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: shm
+              mountPath: /dev/shm
+            - name: workspace
+              mountPath: /workspace

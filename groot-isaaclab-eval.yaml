@@ -1,0 +1,1691 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: groot-eval-sim-scripts
+data:
+  sim_entrypoint.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    ISAAC_PY="/workspace/isaaclab/_isaac_sim/python.sh"
+    ISAACLAB_SH="/workspace/isaaclab/isaaclab.sh"
+    if [[ ! -x "${ISAAC_PY}" ]]; then
+      echo "FATAL: ${ISAAC_PY} not found or not executable" >&2
+      exit 1
+    fi
+    if [[ ! -x "${ISAACLAB_SH}" ]]; then
+      echo "FATAL: ${ISAACLAB_SH} not found or not executable" >&2
+      exit 1
+    fi
+
+    "${ISAAC_PY}" -m pip install --no-cache-dir -q grpcio==1.66.2 gymnasium==1.2.1 imageio==2.34.1 imageio-ffmpeg==0.4.9
+
+    # Ensure PYTHONPATH includes /scripts so g1_manip_env_cfg.py is importable
+    export PYTHONPATH="/scripts${PYTHONPATH:+:${PYTHONPATH}}"
+
+    # Source Isaac Sim env if available
+    set +u
+    if [[ -f /workspace/isaaclab/setup_python_env.sh ]]; then
+      source /workspace/isaaclab/setup_python_env.sh
+    elif [[ -f /workspace/isaaclab/_isaac_sim/setup_python_env.sh ]]; then
+      source /workspace/isaaclab/_isaac_sim/setup_python_env.sh
+    fi
+    set -u
+
+    export OMNI_KIT_ACCEPT_EULA=YES
+    export ACCEPT_EULA=Y
+    export PRIVACY_CONSENT=Y
+
+    exec "${ISAACLAB_SH}" -p /scripts/sim_server.py
+
+  sim_server.py: |
+    #!/usr/bin/env python3
+    """
+    Isaac Lab simulation gRPC server for GR00T closed-loop evaluation.
+
+    Enhanced from groot-rft-two-container.yaml:
+    - Returns camera frames in Reset/Step responses (for GR00T visual input)
+    - Adds GetJointNames RPC (for dynamic joint mapping)
+    - Uses G1 humanoid with joint position control
+    """
+    import os, sys, argparse
+
+    # Step 1: Bootstrap Isaac Sim via AppLauncher (MUST happen before any isaaclab imports)
+    from isaaclab.app import AppLauncher
+    parser = argparse.ArgumentParser(description="Isaac Lab Sim Server - G1 Eval")
+    AppLauncher.add_app_launcher_args(parser)
+    args = parser.parse_args(["--headless", "--enable_cameras"])
+    app_launcher = AppLauncher(args)
+    simulation_app = app_launcher.app
+
+    # Step 2: NOW safe to import everything else
+    import time, pickle, threading, queue
+    from concurrent import futures
+    import numpy as np
+    import grpc
+    import gymnasium as gym
+    from gymnasium.wrappers import RecordVideo
+    import torch
+
+    # Register Isaac Lab tasks
+    import isaaclab_tasks  # noqa: F401
+
+    # Register our custom G1 env (must happen after isaaclab imports)
+    try:
+        import g1_manip_env_cfg  # noqa: F401
+        print("[SIM] Custom G1 env registered: Isaac-G1-ManipJointCtrl-v0")
+    except Exception as e:
+        print(f"[SIM] WARN: Custom env registration failed: {e}")
+        print("[SIM] Will use ISAAC_TASK env var as-is")
+
+    from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+
+    def _to_cpu(obj):
+        """Recursively move tensors to CPU/numpy for serialization."""
+        if isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().numpy()
+        if isinstance(obj, dict):
+            return {k: _to_cpu(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return type(obj)(_to_cpu(v) for v in obj)
+        return obj
+
+    def _serialize(obj):
+        return pickle.dumps(_to_cpu(obj), protocol=pickle.HIGHEST_PROTOCOL)
+
+    def _deserialize(buf):
+        return pickle.loads(buf)
+
+    def _as_np(x):
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    def make_env(task_name: str, video_dir: str, video_every: int):
+        env_cfg = parse_env_cfg(task_name, device="cuda:0", num_envs=1)
+        env_cfg.scene.num_envs = 1
+        env = gym.make(task_name, cfg=env_cfg, render_mode="rgb_array")
+        # Don't wrap with RecordVideo — eval client records frames via gRPC
+        return env
+
+    def extract_proprio(obs):
+        """Extract proprioception as a flat numpy vector from obs dict or tensor."""
+        if isinstance(obs, dict):
+            for k in ("policy", "proprio", "joint_pos", "qpos", "robot_state", "state"):
+                if k in obs:
+                    v = obs[k]
+                    if isinstance(v, dict):
+                        parts = [_as_np(vv).astype(np.float32).reshape(-1) for vv in v.values()]
+                        return np.concatenate(parts)
+                    return _as_np(v).astype(np.float32).reshape(-1)
+            # Fallback: concatenate all small vectors
+            for v in obs.values():
+                v = _as_np(v)
+                if v.ndim == 1 and v.size < 512:
+                    return v.astype(np.float32)
+        arr = _as_np(obs)
+        if arr.ndim == 1:
+            return arr.astype(np.float32)
+        return arr.astype(np.float32).reshape(-1)
+
+    def extract_joint_names(env):
+        """Extract joint names from the Isaac Lab environment."""
+        try:
+            unwrapped = env.unwrapped
+            if hasattr(unwrapped, 'scene') and hasattr(unwrapped.scene, 'articulations'):
+                for name, art in unwrapped.scene.articulations.items():
+                    if hasattr(art, 'joint_names'):
+                        return list(art.joint_names)
+            # Fallback: try data attribute
+            if hasattr(unwrapped, 'robot') and hasattr(unwrapped.robot, 'joint_names'):
+                return list(unwrapped.robot.joint_names)
+        except Exception as e:
+            print(f"[SIM] WARN: Could not extract joint names: {e}")
+        return []
+
+    # All env operations must run on main thread (Isaac Sim requirement)
+    _request_queue = queue.Queue()
+
+    class SimServer:
+        def __init__(self, env, joint_names):
+            self.env = env
+            self.joint_names = joint_names
+            self._episode = 0
+            self._last_obs = None
+
+        def _dispatch(self, op, payload=None):
+            result_event = threading.Event()
+            result_holder = [None, None]
+            _request_queue.put((op, payload, result_event, result_holder))
+            result_event.wait(timeout=60)
+            if result_holder[1] is not None:
+                raise result_holder[1]
+            return result_holder[0]
+
+        def Reset(self, request, context):
+            return self._dispatch("reset")
+
+        def Step(self, request, context):
+            req = _deserialize(request)
+            return self._dispatch("step", req["action"])
+
+        def Render(self, request, context):
+            return self._dispatch("render")
+
+        def GetSpec(self, request, context):
+            return self._dispatch("getspec")
+
+        def GetJointNames(self, request, context):
+            return _serialize({"joint_names": self.joint_names})
+
+        def Close(self, request, context):
+            return self._dispatch("close")
+
+        def Health(self, request, context):
+            return _serialize({"ok": True})
+
+    def _render_frame(env):
+        """Get a camera frame from the env."""
+        try:
+            frame = env.render()
+            if frame is not None:
+                return _as_np(frame)
+        except Exception as e:
+            print(f"[SIM] WARN render: {e}")
+        return None
+
+    def _obs_to_np(obs):
+        """Convert obs to a serializable dict of numpy arrays."""
+        if isinstance(obs, dict):
+            result = {}
+            for k, v in obs.items():
+                if isinstance(v, dict):
+                    result[k] = {kk: _as_np(vv).astype(np.float32) for kk, vv in v.items()}
+                elif isinstance(v, (torch.Tensor, np.ndarray)):
+                    result[k] = _as_np(v).astype(np.float32)
+                else:
+                    try:
+                        result[k] = float(v)
+                    except (TypeError, ValueError):
+                        pass  # skip non-numeric
+            return result
+        return {"flat": _as_np(obs).astype(np.float32)}
+
+    def _process_request(srv, op, payload):
+        if op == "reset":
+            obs = srv.env.reset()
+            if isinstance(obs, tuple):
+                obs = obs[0]
+            srv._last_obs = obs
+            srv._episode += 1
+            proprio = extract_proprio(obs)
+            frame = _render_frame(srv.env)
+            return _serialize({"obs": _obs_to_np(obs), "proprio": proprio, "frame": frame, "episode": srv._episode})
+
+        elif op == "step":
+            action = payload
+            if isinstance(action, np.ndarray):
+                action = torch.from_numpy(action).float().to("cuda:0")
+            if isinstance(action, torch.Tensor) and action.dim() == 1:
+                action = action.unsqueeze(0)
+            out = srv.env.step(action)
+            if len(out) == 5:
+                obs, r, term, trunc, info = out
+            else:
+                obs, r, done, info = out
+                term, trunc = bool(done), False
+            srv._last_obs = obs
+            proprio = extract_proprio(obs)
+            frame = _render_frame(srv.env)
+            r_val = float(_as_np(r)) if isinstance(r, (torch.Tensor, np.ndarray)) else float(r)
+            t_val = bool(_as_np(term)) if isinstance(term, torch.Tensor) else bool(term)
+            tr_val = bool(_as_np(trunc)) if isinstance(trunc, torch.Tensor) else bool(trunc)
+            return _serialize({
+                "obs": _obs_to_np(obs), "proprio": proprio, "frame": frame,
+                "reward": r_val, "terminated": t_val, "truncated": tr_val, "info": {},
+            })
+
+        elif op == "render":
+            frame = _render_frame(srv.env)
+            return _serialize({"frame": frame})
+
+        elif op == "getspec":
+            obs = srv._last_obs
+            if obs is None:
+                obs = srv.env.reset()
+                if isinstance(obs, tuple):
+                    obs = obs[0]
+                srv._last_obs = obs
+            p = extract_proprio(obs)
+            action_dim = int(np.prod(getattr(srv.env, "action_space").shape))
+            return _serialize({"proprio_dim": int(p.shape[0]), "action_dim": action_dim})
+
+        elif op == "close":
+            try:
+                srv.env.close()
+            except Exception:
+                pass
+            return _serialize({"ok": True})
+
+    def serve():
+        task = os.environ.get("ISAAC_TASK", "Isaac-G1-ManipJointCtrl-v0")
+        video_every = int(os.environ.get("VIDEO_EVERY", "1"))
+        video_dir = os.environ.get("VIDEO_DIR", "/shared/videos") + "/" + os.environ.get("POD_NAME", "pod")
+        os.makedirs(video_dir, exist_ok=True)
+
+        print(f"[SIM] Creating environment: {task}")
+        env = make_env(task, video_dir, video_every)
+        joint_names = extract_joint_names(env)
+        print(f"[SIM] Joint names ({len(joint_names)}): {joint_names}")
+
+        srv = SimServer(env, joint_names)
+        print(f"[SIM] Environment created: {task}")
+
+        server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=4),
+            options=[
+                ("grpc.max_receive_message_length", 256 * 1024 * 1024),
+                ("grpc.max_send_message_length", 256 * 1024 * 1024),
+            ],
+        )
+        handlers = {
+            "Reset": grpc.unary_unary_rpc_method_handler(srv.Reset, request_deserializer=lambda x: x, response_serializer=lambda x: x),
+            "Step": grpc.unary_unary_rpc_method_handler(srv.Step, request_deserializer=lambda x: x, response_serializer=lambda x: x),
+            "Render": grpc.unary_unary_rpc_method_handler(srv.Render, request_deserializer=lambda x: x, response_serializer=lambda x: x),
+            "GetSpec": grpc.unary_unary_rpc_method_handler(srv.GetSpec, request_deserializer=lambda x: x, response_serializer=lambda x: x),
+            "GetJointNames": grpc.unary_unary_rpc_method_handler(srv.GetJointNames, request_deserializer=lambda x: x, response_serializer=lambda x: x),
+            "Close": grpc.unary_unary_rpc_method_handler(srv.Close, request_deserializer=lambda x: x, response_serializer=lambda x: x),
+            "Health": grpc.unary_unary_rpc_method_handler(srv.Health, request_deserializer=lambda x: x, response_serializer=lambda x: x),
+        }
+        server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler("SimService", handlers),))
+        port = os.environ.get("SIM_RPC_PORT", "7000")
+        server.add_insecure_port(f"[::]:{port}")
+        server.start()
+        print(f"[SIM] gRPC server listening on port {port}")
+
+        # Main loop: tick Isaac Sim and process gRPC requests on main thread
+        try:
+            while simulation_app.is_running():
+                while not _request_queue.empty():
+                    try:
+                        op, payload, event, holder = _request_queue.get_nowait()
+                        try:
+                            holder[0] = _process_request(srv, op, payload)
+                        except Exception as e:
+                            holder[1] = e
+                        event.set()
+                    except queue.Empty:
+                        break
+                simulation_app.update()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.stop(grace=5)
+
+    if __name__ == "__main__":
+        serve()
+
+  g1_manip_env_cfg.py: |
+    """
+    Custom G1 manipulation environment for GR00T closed-loop evaluation.
+
+    Uses joint position control (NOT IK) so that GR00T's per-body-part
+    joint position outputs map directly to the action space.
+
+    Registers: Isaac-G1-ManipJointCtrl-v0
+    """
+    import gymnasium as gym
+    import math
+
+    from isaaclab.utils import configclass
+    import isaaclab.sim as sim_utils
+    from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
+    from isaaclab.envs import ManagerBasedRLEnvCfg
+    from isaaclab.managers import ObservationGroupCfg, ObservationTermCfg, RewardTermCfg, TerminationTermCfg
+    from isaaclab.scene import InteractiveSceneCfg
+    import isaaclab.envs.mdp as mdp
+
+    # Import G1 robot asset config — need full 37-DOF version with hands + torso
+    # G1_MINIMAL_CFG / G1_CFG have all joints; G1_29DOF_CFG lacks hand joints
+    try:
+        from isaaclab_assets.robots.unitree import G1_MINIMAL_CFG as G1_ROBOT_CFG
+    except ImportError:
+        from isaaclab_assets.robots.unitree import G1_CFG as G1_ROBOT_CFG
+
+    ##
+    # Scene
+    ##
+
+    @configclass
+    class G1ManipSceneCfg(InteractiveSceneCfg):
+        """Scene: G1 robot with table, object, and lighting."""
+
+        ground = AssetBaseCfg(
+            prim_path="/World/ground",
+            spawn=sim_utils.GroundPlaneCfg(),
+        )
+
+        dome_light = AssetBaseCfg(
+            prim_path="/World/DomeLight",
+            spawn=sim_utils.DomeLightCfg(
+                color=(0.75, 0.75, 0.75),
+                intensity=3000.0,
+            ),
+        )
+
+        # Table in front of the robot
+        table = AssetBaseCfg(
+            prim_path="{ENV_REGEX_NS}/Table",
+            spawn=sim_utils.CuboidCfg(
+                size=(0.8, 1.2, 0.05),
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.6, 0.4, 0.2)),
+            ),
+            init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.55, 0.4)),
+        )
+
+        # Table legs (4 legs)
+        table_leg_fl = AssetBaseCfg(
+            prim_path="{ENV_REGEX_NS}/TableLegFL",
+            spawn=sim_utils.CylinderCfg(
+                radius=0.025, height=0.4,
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.4, 0.3, 0.15)),
+            ),
+            init_state=AssetBaseCfg.InitialStateCfg(pos=(-0.35, 0.15, 0.2)),
+        )
+        table_leg_fr = AssetBaseCfg(
+            prim_path="{ENV_REGEX_NS}/TableLegFR",
+            spawn=sim_utils.CylinderCfg(
+                radius=0.025, height=0.4,
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.4, 0.3, 0.15)),
+            ),
+            init_state=AssetBaseCfg.InitialStateCfg(pos=(0.35, 0.15, 0.2)),
+        )
+        table_leg_bl = AssetBaseCfg(
+            prim_path="{ENV_REGEX_NS}/TableLegBL",
+            spawn=sim_utils.CylinderCfg(
+                radius=0.025, height=0.4,
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.4, 0.3, 0.15)),
+            ),
+            init_state=AssetBaseCfg.InitialStateCfg(pos=(-0.35, 0.95, 0.2)),
+        )
+        table_leg_br = AssetBaseCfg(
+            prim_path="{ENV_REGEX_NS}/TableLegBR",
+            spawn=sim_utils.CylinderCfg(
+                radius=0.025, height=0.4,
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.4, 0.3, 0.15)),
+            ),
+            init_state=AssetBaseCfg.InitialStateCfg(pos=(0.35, 0.95, 0.2)),
+        )
+
+        # Object on the table (small red cube)
+        cube_object: RigidObjectCfg = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/CubeObject",
+            spawn=sim_utils.CuboidCfg(
+                size=(0.06, 0.06, 0.06),
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+                mass_props=sim_utils.MassPropertiesCfg(mass=0.1),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.9, 0.15, 0.15)),
+            ),
+            init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.15, 0.55, 0.46)),
+        )
+
+        # Robot
+        robot: ArticulationCfg = G1_ROBOT_CFG.replace(
+            prim_path="{ENV_REGEX_NS}/Robot",
+        )
+
+        def __post_init__(self):
+            """Fix the robot's root link so it doesn't fall over."""
+            self.robot.spawn.articulation_props.fix_root_link = True
+
+    ##
+    # Observations
+    ##
+
+    @configclass
+    class ObservationsCfg:
+        @configclass
+        class PolicyCfg(ObservationGroupCfg):
+            """Absolute joint positions and velocities for the robot."""
+            joint_pos = ObservationTermCfg(func=mdp.joint_pos)
+            joint_vel = ObservationTermCfg(func=mdp.joint_vel_rel)
+
+            def __post_init__(self):
+                self.enable_corruption = False
+                self.concatenate_terms = True
+
+        policy: PolicyCfg = PolicyCfg()
+
+    ##
+    # Actions
+    ##
+
+    @configclass
+    class ActionsCfg:
+        """Joint position control — absolute targets (matching GR00T output)."""
+        joint_pos = mdp.JointPositionActionCfg(
+            asset_name="robot",
+            joint_names=[".*"],
+            scale=1.0,
+            use_default_offset=False,
+        )
+
+    ##
+    # Rewards (minimal — eval only, no training)
+    ##
+
+    @configclass
+    class RewardsCfg:
+        """No rewards needed for evaluation."""
+        pass
+
+    ##
+    # Terminations
+    ##
+
+    @configclass
+    class TerminationsCfg:
+        """Time-based termination only."""
+        time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
+
+    ##
+    # Environment
+    ##
+
+    @configclass
+    class G1ManipJointCtrlEnvCfg(ManagerBasedRLEnvCfg):
+        """G1 manipulation env with joint position control."""
+
+        scene: G1ManipSceneCfg = G1ManipSceneCfg(num_envs=1, env_spacing=5.0)
+        observations: ObservationsCfg = ObservationsCfg()
+        actions: ActionsCfg = ActionsCfg()
+        rewards: RewardsCfg = RewardsCfg()
+        terminations: TerminationsCfg = TerminationsCfg()
+
+        episode_length_s = 120.0  # 2 minutes per eval episode
+
+        def __post_init__(self):
+            # Simulation settings
+            self.sim.dt = 0.005  # 200 Hz physics
+            self.decimation = 4  # 50 Hz control
+            self.sim.render_interval = self.decimation
+            # Viewer camera: front-right angle showing robot + table
+            self.viewer.eye = (1.5, -0.5, 1.2)
+            self.viewer.lookat = (0.0, 0.5, 0.6)
+
+    ##
+    # Register with Gymnasium
+    ##
+
+    gym.register(
+        id="Isaac-G1-ManipJointCtrl-v0",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}:G1ManipJointCtrlEnvCfg",
+        },
+    )
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: groot-eval-client-scripts
+data:
+  eval_entrypoint.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y --no-install-recommends python3.10 python3.10-venv python3.10-dev git ffmpeg ca-certificates
+    rm -rf /var/lib/apt/lists/*
+
+    python3.10 -m venv /opt/venv
+    source /opt/venv/bin/activate
+    python -m pip install --upgrade pip
+
+    # PyTorch CUDA wheels
+    export PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu121
+    python -m pip install --no-cache-dir \
+      torch==2.7.1 torchvision==0.22.1 \
+      wandb==0.25.0 \
+      transformers==4.51.3 accelerate==0.33.0 safetensors==0.4.5 \
+      grpcio==1.66.2 numpy==1.26.4 \
+      albumentations==1.4.18 diffusers==0.35.1 dm-tree==0.1.8 \
+      datasets==3.6.0 peft==0.17.1 msgpack==1.1.0 msgpack-numpy==0.4.8 \
+      omegaconf==2.3.0 tyro==0.9.17 \
+      einops scipy termcolor lmdb av pyzmq click imageio imageio-ffmpeg
+
+    # Install GR00T repo (--no-deps; flash-attn skipped)
+    if [[ ! -d /workspace/Isaac-GR00T ]]; then
+      git clone --depth 1 https://github.com/NVIDIA/Isaac-GR00T /workspace/Isaac-GR00T
+    fi
+    python -m pip install --no-deps -e /workspace/Isaac-GR00T
+    export PYTHONPATH="/workspace/Isaac-GR00T${PYTHONPATH:+:${PYTHONPATH}}"
+
+    # Patch: flash_attention_2 -> sdpa
+    python -c "
+    import re
+    path = '/workspace/Isaac-GR00T/gr00t/model/modules/eagle_backbone.py'
+    with open(path) as f: code = f.read()
+    code = code.replace('\"flash_attention_2\"', '\"sdpa\"')
+    code = code.replace(
+        'self.model = AutoModel.from_config(config, trust_remote_code=True)',
+        'config._attn_implementation = \"sdpa\"\n            self.model = AutoModel.from_config(config, trust_remote_code=True, attn_implementation=\"sdpa\")'
+    )
+    with open(path, 'w') as f: f.write(code)
+    print('[patch] eagle_backbone.py: flash_attention_2 -> sdpa')
+    "
+
+    # Patch: Eagle VL model code — comprehensive flash_attn → SDPA
+    python << 'EAGLE_PATCH'
+    import os
+    eagle_dir = "/workspace/Isaac-GR00T/gr00t/model/modules/nvidia/Eagle-Block2A-2B-v2"
+    patched = 0
+    for root, dirs, files in os.walk(eagle_dir):
+        for fname in files:
+            if not fname.endswith(".py"):
+                continue
+            fpath = os.path.join(root, fname)
+            with open(fpath) as f:
+                code = f.read()
+            orig = code
+            # Replace flash_attention_2 string references
+            if "flash_attention_2" in code:
+                code = code.replace(
+                    "assert config.text_config._attn_implementation == 'flash_attention_2'",
+                    "pass  # PATCHED: removed flash_attention_2 requirement"
+                )
+                code = code.replace(
+                    'assert config.text_config._attn_implementation == "flash_attention_2"',
+                    "pass  # PATCHED: removed flash_attention_2 requirement"
+                )
+                code = code.replace("'flash_attention_2'", "'sdpa'")
+                code = code.replace('"flash_attention_2"', '"sdpa"')
+            if code != orig:
+                with open(fpath, "w") as f:
+                    f.write(code)
+                patched += 1
+                print(f"[patch] Patched {fpath}")
+    print(f"[patch] Patched {patched} Eagle VL file(s)")
+
+    EAGLE_PATCH
+
+    # Comprehensive flash_attn stub: make flash_attn importable with SDPA fallbacks
+    python /scripts/create_flash_attn_stub.py
+
+    # Copy modality config
+    cp /scripts/g1_teleop_config.py /workspace/Isaac-GR00T/g1_teleop_config.py
+
+    # Wait for sim RPC to be ready
+    python /scripts/wait_for_sim.py
+
+    # Run evaluation
+    python /scripts/eval_client.py
+
+  create_flash_attn_stub.py: |
+    """Create flash_attn SDPA stub package so Eagle model code can import it."""
+    import os
+    site_pkgs = "/opt/venv/lib/python3.10/site-packages"
+    stub_dir = os.path.join(site_pkgs, "flash_attn")
+    os.makedirs(stub_dir, exist_ok=True)
+
+    # Create dist-info so importlib.metadata.version("flash_attn") works
+    dist_info = os.path.join(site_pkgs, "flash_attn-2.6.3.dist-info")
+    os.makedirs(dist_info, exist_ok=True)
+    with open(os.path.join(dist_info, "METADATA"), "w") as f:
+        f.write("Metadata-Version: 2.1\nName: flash-attn\nVersion: 2.6.3\n")
+    with open(os.path.join(dist_info, "RECORD"), "w") as f:
+        f.write("")
+    with open(os.path.join(dist_info, "INSTALLER"), "w") as f:
+        f.write("pip")
+    with open(os.path.join(dist_info, "top_level.txt"), "w") as f:
+        f.write("flash_attn\n")
+
+    # Main flash_attn module with SDPA-backed implementations
+    init_code = [
+        "# PATCHED: flash_attn stub using PyTorch SDPA - provides SDPA-based fallbacks",
+        "__version__ = '2.6.3'  # fake version so is_flash_attn_2_available() returns True",
+        "flash_attn_version = '2.6.3'",
+        "import torch",
+        "import torch.nn.functional as F",
+        "",
+        "def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1,-1), **kwargs):",
+        "    if softmax_scale is None:",
+        "        softmax_scale = q.shape[-1] ** -0.5",
+        "    if q.dim() == 4:",
+        "        q = q.transpose(1, 2)",
+        "        k = k.transpose(1, 2)",
+        "        v = v.transpose(1, 2)",
+        "    out = F.scaled_dot_product_attention(q, k, v, is_causal=causal, dropout_p=dropout_p, scale=softmax_scale)",
+        "    if out.dim() == 4:",
+        "        out = out.transpose(1, 2)",
+        "    return out",
+        "",
+        "def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,",
+        "                           dropout_p=0.0, softmax_scale=None, causal=False, **kwargs):",
+        "    if softmax_scale is None:",
+        "        softmax_scale = q.shape[-1] ** -0.5",
+        "    batch_size = len(cu_seqlens_q) - 1",
+        "    outputs = []",
+        "    for i in range(batch_size):",
+        "        sq, eq = int(cu_seqlens_q[i]), int(cu_seqlens_q[i+1])",
+        "        sk, ek = int(cu_seqlens_k[i]), int(cu_seqlens_k[i+1])",
+        "        qi = q[sq:eq].unsqueeze(0).transpose(1, 2)",
+        "        ki = k[sk:ek].unsqueeze(0).transpose(1, 2)",
+        "        vi = v[sk:ek].unsqueeze(0).transpose(1, 2)",
+        "        oi = F.scaled_dot_product_attention(qi, ki, vi, is_causal=causal, dropout_p=dropout_p, scale=softmax_scale)",
+        "        outputs.append(oi.transpose(1, 2).squeeze(0))",
+        "    return torch.cat(outputs, dim=0)",
+        "",
+        "def flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen, dropout_p=0.0, softmax_scale=None, causal=False, **kwargs):",
+        "    q, k, v = qkv.unbind(dim=2)",
+        "    return flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,",
+        "                                  dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal, **kwargs)",
+    ]
+    with open(os.path.join(stub_dir, "__init__.py"), "w") as f:
+        f.write("\n".join(init_code) + "\n")
+
+    # bert_padding sub-module
+    bp_dir = os.path.join(stub_dir, "bert_padding")
+    os.makedirs(bp_dir, exist_ok=True)
+    bp_code = [
+        "import torch",
+        "",
+        "def index_first_axis(hidden_states, indices):",
+        "    return hidden_states[indices]",
+        "",
+        "def pad_input(hidden_states, indices, batch_size, seqlen):",
+        "    output = torch.zeros(batch_size, seqlen, *hidden_states.shape[1:],",
+        "                         device=hidden_states.device, dtype=hidden_states.dtype)",
+        "    output.view(-1, *hidden_states.shape[1:])[indices] = hidden_states",
+        "    return output",
+        "",
+        "def unpad_input(hidden_states, attention_mask):",
+        "    seqlens = attention_mask.sum(dim=-1, dtype=torch.int32)",
+        "    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()",
+        "    max_seqlen = seqlens.max().item()",
+        "    cu_seqlens = torch.cat([torch.zeros(1, dtype=torch.int32, device=seqlens.device),",
+        "                            seqlens.cumsum(0, dtype=torch.int32)])",
+        "    return hidden_states.view(-1, *hidden_states.shape[2:])[indices], indices, cu_seqlens, max_seqlen",
+    ]
+    with open(os.path.join(bp_dir, "__init__.py"), "w") as f:
+        f.write("\n".join(bp_code) + "\n")
+
+    # layers.rotary sub-module (needed by transformers.modeling_flash_attention_utils)
+    layers_dir = os.path.join(stub_dir, "layers")
+    os.makedirs(layers_dir, exist_ok=True)
+    with open(os.path.join(layers_dir, "__init__.py"), "w") as f:
+        f.write("")
+    rotary_code = [
+        "import torch",
+        "",
+        "def apply_rotary_emb(x, cos, sin, interleaved=False, inplace=False, conjugate=False):",
+        "    # Stub: apply rotary embeddings using standard torch ops",
+        "    cos = cos.to(x.dtype)",
+        "    sin = sin.to(x.dtype)",
+        "    if cos.dim() == 2:",
+        "        cos = cos.unsqueeze(0).unsqueeze(0)",
+        "        sin = sin.unsqueeze(0).unsqueeze(0)",
+        "    d = x.shape[-1] // 2",
+        "    x1 = x[..., :d]",
+        "    x2 = x[..., d:]",
+        "    o1 = x1 * cos[..., :d] - x2 * sin[..., :d]",
+        "    o2 = x2 * cos[..., :d] + x1 * sin[..., :d]",
+        "    return torch.cat([o1, o2], dim=-1)",
+    ]
+    with open(os.path.join(layers_dir, "rotary.py"), "w") as f:
+        f.write("\n".join(rotary_code) + "\n")
+
+    print("[patch] Created flash_attn SDPA stubs at", stub_dir)
+
+  wait_for_sim.py: |
+    import os, time, grpc, pickle
+    def ser(x): return pickle.dumps(x, protocol=pickle.HIGHEST_PROTOCOL)
+    def deser(x): return pickle.loads(x)
+    addr = os.environ.get("SIM_RPC_ADDR", "127.0.0.1:7000")
+    channel = grpc.insecure_channel(addr)
+    health = channel.unary_unary("/SimService/Health", request_serializer=ser, response_deserializer=deser)
+    for i in range(180):
+        try:
+            resp = health({})
+            if resp.get("ok"):
+                print(f"[eval] sim ready after {i+1}s")
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+    else:
+        raise RuntimeError("sim RPC not ready after 180s")
+
+  g1_teleop_config.py: |
+    """Register NEW_EMBODIMENT modality config for GR00T G1 teleop model."""
+    from gr00t.configs.data.embodiment_configs import register_modality_config
+    from gr00t.data.embodiment_tags import EmbodimentTag
+    from gr00t.data.types import ActionConfig, ActionFormat, ActionRepresentation, ActionType, ModalityConfig
+
+    g1_teleop_config = {
+        "video": ModalityConfig(delta_indices=[0], modality_keys=["rs_view"]),
+        "state": ModalityConfig(
+            delta_indices=[0],
+            modality_keys=["left_leg", "right_leg", "waist", "left_arm", "left_hand", "right_arm", "right_hand"],
+        ),
+        "action": ModalityConfig(
+            delta_indices=list(range(16)),
+            modality_keys=["left_leg", "right_leg", "waist", "left_arm", "left_hand", "right_arm", "right_hand"],
+            action_configs=[
+                ActionConfig(rep=ActionRepresentation.RELATIVE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),
+                ActionConfig(rep=ActionRepresentation.RELATIVE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),
+                ActionConfig(rep=ActionRepresentation.ABSOLUTE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),
+                ActionConfig(rep=ActionRepresentation.RELATIVE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),
+                ActionConfig(rep=ActionRepresentation.ABSOLUTE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),
+                ActionConfig(rep=ActionRepresentation.RELATIVE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),
+                ActionConfig(rep=ActionRepresentation.ABSOLUTE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),
+            ],
+        ),
+        "language": ModalityConfig(delta_indices=[0], modality_keys=["annotation.human.task_description"]),
+    }
+    register_modality_config(g1_teleop_config, embodiment_tag=EmbodimentTag.NEW_EMBODIMENT)
+
+  g1_joint_mapper.py: |
+    """
+    Bidirectional joint mapping between Isaac Lab flat DOF vectors and
+    GR00T per-body-part observation/action format.
+
+    The GR00T model was trained on G1 teleop data with 43 DOFs per body part:
+      waist=3, left_arm=7, right_arm=7, left_hand=7, right_hand=7,
+      left_leg=6, right_leg=6
+    Isaac Lab's G1_MINIMAL_CFG has 37 DOFs (1 waist, 5 per arm, 7 per hand,
+    6 per leg). This mapper pads the missing dimensions (waist roll/pitch,
+    wrist joints) with zeros for state, and trims action output accordingly.
+    """
+    import numpy as np
+    from typing import Optional
+
+    # Expected dimensions per body part (from training data statistics.json)
+    EXPECTED_DIMS = {
+        "left_leg": 6,
+        "right_leg": 6,
+        "waist": 3,
+        "left_arm": 7,
+        "left_hand": 7,
+        "right_arm": 7,
+        "right_hand": 7,
+    }
+
+    # G1 body parts -> sim joint names (from G1_MINIMAL_CFG / G1_CFG)
+    # Order within each body part matches the training data convention:
+    #   waist: [yaw, roll, pitch] — sim only has torso_joint (≈yaw)
+    #   arm: [shoulder_p, shoulder_r, shoulder_y, elbow_p, elbow_r, wrist?, wrist?]
+    #         sim has first 5, training expects 7
+    G1_BODY_PARTS = {
+        "waist": ["torso_joint"],
+        "left_arm": [
+            "left_shoulder_pitch_joint",
+            "left_shoulder_roll_joint",
+            "left_shoulder_yaw_joint",
+            "left_elbow_pitch_joint",
+            "left_elbow_roll_joint",
+        ],
+        "right_arm": [
+            "right_shoulder_pitch_joint",
+            "right_shoulder_roll_joint",
+            "right_shoulder_yaw_joint",
+            "right_elbow_pitch_joint",
+            "right_elbow_roll_joint",
+        ],
+        "left_hand": [
+            "left_five_joint",
+            "left_three_joint",
+            "left_zero_joint",
+            "left_six_joint",
+            "left_four_joint",
+            "left_one_joint",
+            "left_two_joint",
+        ],
+        "right_hand": [
+            "right_five_joint",
+            "right_three_joint",
+            "right_zero_joint",
+            "right_six_joint",
+            "right_four_joint",
+            "right_one_joint",
+            "right_two_joint",
+        ],
+        "left_leg": [
+            "left_hip_pitch_joint",
+            "left_hip_roll_joint",
+            "left_hip_yaw_joint",
+            "left_knee_joint",
+            "left_ankle_pitch_joint",
+            "left_ankle_roll_joint",
+        ],
+        "right_leg": [
+            "right_hip_pitch_joint",
+            "right_hip_roll_joint",
+            "right_hip_yaw_joint",
+            "right_knee_joint",
+            "right_ankle_pitch_joint",
+            "right_ankle_roll_joint",
+        ],
+    }
+
+
+    # Which body parts use RELATIVE action representation (deltas from current state).
+    # These must be added to current joint positions before sending to the sim.
+    # (Matches the action_configs order in g1_teleop_config.py)
+    RELATIVE_PARTS = {"left_leg", "right_leg", "left_arm", "right_arm"}
+    # These body parts use ABSOLUTE action representation (direct joint targets).
+    ABSOLUTE_PARTS = {"waist", "left_hand", "right_hand"}
+
+
+    class G1JointMapper:
+        """Maps between Isaac Lab flat joint vectors and GR00T body-part dicts.
+
+        Handles dimension mismatch between sim (37 DOFs) and training data (43 DOFs)
+        by padding state with zeros and trimming actions.
+
+        Also handles RELATIVE vs ABSOLUTE action conversion: body parts trained with
+        RELATIVE actions output deltas, which must be added to the current joint state
+        before sending as absolute position targets to the sim.
+        """
+
+        def __init__(self, sim_joint_names: list[str]):
+            self.sim_joint_names = sim_joint_names
+            self.n_joints = len(sim_joint_names)
+
+            # Build index mapping: body_part -> [indices into flat sim vector]
+            self.part_indices = {}
+            self.part_names = {}
+            for part, joints in G1_BODY_PARTS.items():
+                indices = []
+                found = []
+                for j in joints:
+                    if j in sim_joint_names:
+                        indices.append(sim_joint_names.index(j))
+                        found.append(j)
+                if indices:
+                    self.part_indices[part] = indices
+                    self.part_names[part] = found
+                else:
+                    # Even if no joints found, still register the part for padding
+                    self.part_indices[part] = []
+                    self.part_names[part] = []
+
+                expected = EXPECTED_DIMS.get(part, len(indices))
+                n_sim = len(indices)
+                status = "OK" if n_sim == expected else f"PADDED ({n_sim} sim -> {expected} expected)"
+                print(f"[mapper] {part}: {n_sim} sim DOFs, {expected} expected DOFs [{status}]")
+
+            mapped = sum(len(v) for v in self.part_indices.values())
+            total_expected = sum(EXPECTED_DIMS.values())
+            print(f"[mapper] Mapped {mapped}/{self.n_joints} sim joints across {len(self.part_indices)} body parts")
+            print(f"[mapper] Model expects {total_expected} total DOFs, sim has {self.n_joints}")
+
+        def flat_to_parts(self, flat_vec: np.ndarray) -> dict[str, np.ndarray]:
+            """Split flat joint vector into per-body-part arrays with expected dimensions.
+
+            Pads with zeros if the sim has fewer joints than the model expects.
+            """
+            flat = np.asarray(flat_vec, dtype=np.float32).reshape(-1)
+            parts = {}
+            for part, indices in self.part_indices.items():
+                expected_dim = EXPECTED_DIMS.get(part, len(indices))
+                padded = np.zeros(expected_dim, dtype=np.float32)
+                # Fill sim values into the first N positions
+                n_sim = min(len(indices), expected_dim)
+                for i in range(n_sim):
+                    if indices[i] < len(flat):
+                        padded[i] = flat[indices[i]]
+                parts[part] = padded
+            return parts
+
+        def parts_to_flat(self, parts: dict[str, np.ndarray], default: float = 0.0) -> np.ndarray:
+            """Merge per-body-part arrays into a flat sim joint vector.
+
+            Only uses the first N values from each body part (matching sim joints),
+            discards extra DOFs (e.g. wrist actions) that the sim doesn't support.
+            """
+            flat = np.full(self.n_joints, default, dtype=np.float32)
+            for part, indices in self.part_indices.items():
+                if part in parts:
+                    vals = np.asarray(parts[part], dtype=np.float32).reshape(-1)
+                    # Only copy values for joints that exist in sim
+                    n = min(len(indices), len(vals))
+                    for i in range(n):
+                        flat[indices[i]] = vals[i]
+            return flat
+
+        def obs_to_groot(
+            self,
+            flat_joints: np.ndarray,
+            camera_frame: Optional[np.ndarray],
+            task_description: str,
+        ) -> dict:
+            """
+            Convert Isaac Lab observations to GR00T nested input format.
+
+            Returns dict with top-level keys: video, state, language
+              - video: {"rs_view": (B=1, T=1, H, W, 3) uint8}
+              - state: {body_part: (B=1, T=1, D) float32} where D = EXPECTED_DIMS[part]
+              - language: {"annotation.human.task_description": [["task desc"]]}
+            """
+            # State: split flat joints into body parts, padded to expected dims
+            state = {}
+            parts = self.flat_to_parts(flat_joints)
+            for part, vals in parts.items():
+                state[part] = vals.reshape(1, 1, -1).astype(np.float32)
+
+            # Video: (B=1, T=1, H, W, 3) uint8
+            if camera_frame is not None:
+                frame = np.asarray(camera_frame, dtype=np.uint8)
+                if frame.ndim == 3:  # (H, W, C)
+                    frame = frame[np.newaxis, np.newaxis, ...]  # (1, 1, H, W, C)
+                elif frame.ndim == 4:  # (1, H, W, C)
+                    frame = frame[:, np.newaxis, ...]
+            else:
+                frame = np.zeros((1, 1, 224, 224, 3), dtype=np.uint8)
+
+            video = {"rs_view": frame}
+
+            # Language
+            language = {"annotation.human.task_description": [[task_description]]}
+
+            return {"video": video, "state": state, "language": language}
+
+        def action_chunk_from_groot(self, groot_actions: dict, current_proprio: Optional[np.ndarray] = None) -> list:
+            """
+            Convert GR00T per-body-part action chunk to a list of flat sim joint vectors.
+
+            For RELATIVE body parts (arms, legs), the model outputs deltas from the
+            current state. These are added to current_proprio to produce absolute targets.
+            For ABSOLUTE body parts (waist, hands), the model outputs direct targets.
+
+            groot_actions keys: {body_part} with shape (B, T, D) where T=16 (action horizon).
+            current_proprio: flat (n_joints,) current joint positions from the sim.
+            Returns: list of T flat numpy arrays, each of shape (n_joints,)
+            """
+            # Get current state per body part (for relative→absolute conversion)
+            current_parts = {}
+            if current_proprio is not None:
+                current_parts = self.flat_to_parts(current_proprio)
+
+            # Determine chunk size T from the first available action
+            T = 1
+            for part in self.part_indices:
+                for key in (f"action.{part}", part):
+                    if key in groot_actions:
+                        val = np.asarray(groot_actions[key], dtype=np.float32)
+                        # Shape is (B, T, D) — get T
+                        if val.ndim >= 2:
+                            T = val.shape[-2] if val.ndim == 3 else val.shape[0]
+                            if val.ndim == 3:
+                                T = val.shape[1]
+                        break
+                break
+
+            flat_actions = []
+
+            for t in range(T):
+                parts = {}
+                for part in self.part_indices:
+                    val = None
+                    for key in (f"action.{part}", part):
+                        if key in groot_actions:
+                            val = np.asarray(groot_actions[key], dtype=np.float32)
+                            break
+                    if val is None:
+                        continue
+                    # Extract timestep t: (B, T, D) -> (D,)
+                    if val.ndim == 3:
+                        val = val[0, t, :]  # first batch, timestep t
+                    elif val.ndim == 2:
+                        val = val[t, :]
+                    else:
+                        pass  # already 1D
+
+                    # Convert RELATIVE actions to ABSOLUTE by adding current state
+                    # Each timestep t is a delta from the ORIGINAL state at query time
+                    # (NOT accumulated: delta[t] means "offset from current" at future t)
+                    if part in RELATIVE_PARTS and part in current_parts:
+                        n = min(len(val), len(current_parts[part]))
+                        absolute = current_parts[part].copy()
+                        absolute[:n] += val[:n]
+                        parts[part] = absolute
+                    else:
+                        # ABSOLUTE parts: use model output directly
+                        parts[part] = val
+
+                flat_actions.append(self.parts_to_flat(parts, default=0.0))
+
+            return flat_actions
+
+  eval_client.py: |
+    """
+    GR00T closed-loop evaluation client for Isaac Lab.
+
+    Iterates over sweep trial artifacts from W&B, loads each GR00T checkpoint,
+    runs rollouts in Isaac Lab via gRPC, and logs videos + metrics to W&B.
+    """
+    import os, sys, time, shutil, pickle
+    from pathlib import Path
+    import numpy as np
+    import grpc
+    import wandb
+    import imageio
+
+    # Register modality config
+    sys.path.insert(0, "/workspace/Isaac-GR00T")
+    import g1_teleop_config  # noqa: F401
+
+    from gr00t.data.embodiment_tags import EmbodimentTag
+    from gr00t.policy.gr00t_policy import Gr00tPolicy
+
+    # Import joint mapper
+    sys.path.insert(0, "/scripts")
+    from g1_joint_mapper import G1JointMapper, RELATIVE_PARTS, ABSOLUTE_PARTS
+
+    # ---- Configuration ----
+    ENTITY = os.environ.get("WANDB_ENTITY", "wandb-smle")
+    PROJECT = os.environ.get("WANDB_PROJECT", "isaacsim-nvidia-vla-crwv")
+    N_EPISODES = int(os.environ.get("N_EPISODES", "10"))
+    MAX_STEPS = int(os.environ.get("MAX_EPISODE_STEPS", "500"))
+    TASK_DESC = os.environ.get("TASK_DESCRIPTION", "Pick up the apple and place it on the plate")
+    SIM_ADDR = os.environ.get("SIM_RPC_ADDR", "127.0.0.1:7000")
+    VIDEO_DIR = Path(os.environ.get("VIDEO_DIR", "/shared/eval_videos"))
+
+
+    class SimClient:
+        """gRPC client for the Isaac Lab sim server."""
+
+        def __init__(self, addr: str):
+            self.channel = grpc.insecure_channel(
+                addr,
+                options=[
+                    ("grpc.max_receive_message_length", 256 * 1024 * 1024),
+                    ("grpc.max_send_message_length", 256 * 1024 * 1024),
+                ],
+            )
+            self._reset = self.channel.unary_unary(
+                "/SimService/Reset",
+                request_serializer=self._ser, response_deserializer=self._deser,
+            )
+            self._step = self.channel.unary_unary(
+                "/SimService/Step",
+                request_serializer=self._ser, response_deserializer=self._deser,
+            )
+            self._render = self.channel.unary_unary(
+                "/SimService/Render",
+                request_serializer=self._ser, response_deserializer=self._deser,
+            )
+            self._spec = self.channel.unary_unary(
+                "/SimService/GetSpec",
+                request_serializer=self._ser, response_deserializer=self._deser,
+            )
+            self._joint_names = self.channel.unary_unary(
+                "/SimService/GetJointNames",
+                request_serializer=self._ser, response_deserializer=self._deser,
+            )
+            self._close = self.channel.unary_unary(
+                "/SimService/Close",
+                request_serializer=self._ser, response_deserializer=self._deser,
+            )
+
+        @staticmethod
+        def _ser(x):
+            return pickle.dumps(x, protocol=pickle.HIGHEST_PROTOCOL)
+
+        @staticmethod
+        def _deser(x):
+            return pickle.loads(x)
+
+        def reset(self):
+            return self._reset({})
+
+        def step(self, action):
+            return self._step({"action": action})
+
+        def render(self):
+            return self._render({})
+
+        def get_spec(self):
+            return self._spec({})
+
+        def get_joint_names(self):
+            resp = self._joint_names({})
+            return resp.get("joint_names", [])
+
+
+    def extract_proprio(obs):
+        """Extract flat proprioception vector from Isaac Lab observation."""
+        if isinstance(obs, dict):
+            for k in ("policy", "proprio", "joint_pos", "qpos", "state"):
+                if k in obs:
+                    v = obs[k]
+                    if isinstance(v, dict):
+                        parts = [np.asarray(vv, dtype=np.float32).reshape(-1) for vv in v.values()]
+                        return np.concatenate(parts)
+                    return np.asarray(v, dtype=np.float32).reshape(-1)
+            for v in obs.values():
+                v = np.asarray(v)
+                if v.ndim == 1 and v.size < 512:
+                    return v.astype(np.float32)
+        arr = np.asarray(obs, dtype=np.float32)
+        return arr.reshape(-1)
+
+
+    def run_episode(policy, sim: SimClient, mapper: G1JointMapper, ep_idx: int, video_dir: Path):
+        """Run one evaluation episode. Returns metrics dict + video path."""
+        print(f"  [ep {ep_idx}] Resetting...")
+        resp = sim.reset()
+        obs = resp.get("obs", {})
+        frame = resp.get("frame")
+
+        proprio = resp.get("proprio")
+        if proprio is None:
+            proprio = extract_proprio(obs)
+
+        print(f"  [ep {ep_idx}] Reset done. proprio shape={proprio.shape}, "
+              f"frame={'None' if frame is None else str(np.asarray(frame).shape)}")
+
+        frames = []
+        if frame is not None:
+            frames.append(np.asarray(frame, dtype=np.uint8))
+
+        total_reward = 0.0
+        terminated = False
+        policy_errors = 0
+        step = 0
+
+        action_chunk = []  # buffered action chunk from GR00T
+        chunk_idx = 0      # current position in chunk
+
+        for step in range(MAX_STEPS):
+            # Re-query policy when chunk is exhausted
+            if chunk_idx >= len(action_chunk):
+                groot_obs = mapper.obs_to_groot(proprio, frame, TASK_DESC)
+                try:
+                    action_dict, _info = policy.get_action(groot_obs)
+                    action_chunk = mapper.action_chunk_from_groot(action_dict, current_proprio=proprio)
+                    chunk_idx = 0
+                    if step == 0 and ep_idx == 0:
+                        print(f"    Action chunk size: {len(action_chunk)}")
+                        print(f"    Chunk[0] range: [{action_chunk[0].min():.4f}, {action_chunk[0].max():.4f}]")
+                        print(f"    Chunk[-1] range: [{action_chunk[-1].min():.4f}, {action_chunk[-1].max():.4f}]")
+                        # Log relative vs absolute handling
+                        print(f"    RELATIVE parts (delta→absolute): {RELATIVE_PARTS}")
+                        print(f"    ABSOLUTE parts (direct target): {ABSOLUTE_PARTS}")
+                except Exception as e:
+                    policy_errors += 1
+                    if policy_errors <= 3:
+                        print(f"  [ep {ep_idx}] Policy error at step {step}: {e}")
+                        import traceback; traceback.print_exc()
+                    action_chunk = [np.zeros(mapper.n_joints, dtype=np.float32)]
+                    chunk_idx = 0
+
+            flat_action = action_chunk[chunk_idx]
+            chunk_idx += 1
+
+            # Step simulation
+            try:
+                resp = sim.step(flat_action)
+            except Exception as e:
+                print(f"  [ep {ep_idx}] Sim error at step {step}: {e}")
+                break
+
+            obs = resp.get("obs", {})
+            frame = resp.get("frame")
+            reward = resp.get("reward", 0.0)
+            terminated = resp.get("terminated", False)
+            truncated = resp.get("truncated", False)
+
+            proprio = resp.get("proprio")
+            if proprio is None:
+                proprio = extract_proprio(obs)
+            total_reward += reward
+
+            if frame is not None:
+                frames.append(np.asarray(frame, dtype=np.uint8))
+
+            if step < 3:
+                print(f"  [ep {ep_idx}] Step {step}: reward={reward:.4f}, "
+                      f"term={terminated}, trunc={truncated}, "
+                      f"action=[{flat_action.min():.3f},{flat_action.max():.3f}]")
+
+            if terminated or truncated:
+                print(f"  [ep {ep_idx}] Done at step {step}: term={terminated}, trunc={truncated}")
+                break
+
+        if policy_errors > 0:
+            print(f"  [ep {ep_idx}] Total policy errors: {policy_errors}/{step+1} steps")
+
+        # Save video
+        video_path = None
+        if frames:
+            video_dir.mkdir(parents=True, exist_ok=True)
+            video_path = video_dir / f"episode_{ep_idx}.mp4"
+            try:
+                writer = imageio.get_writer(str(video_path), fps=20, codec="libx264",
+                                            output_params=["-crf", "22", "-pix_fmt", "yuv420p"])
+                for f in frames:
+                    if f.ndim == 2:
+                        f = np.stack([f, f, f], axis=-1)
+                    if f.ndim == 4:
+                        f = f[0]
+                    writer.append_data(f)
+                writer.close()
+                print(f"  [ep {ep_idx}] Video saved: {video_path} ({len(frames)} frames)")
+            except Exception as e:
+                print(f"  [ep {ep_idx}] Video save failed: {e}")
+                video_path = None
+
+        return {
+            "total_reward": total_reward,
+            "episode_length": step + 1,
+            "terminated": terminated,
+            "video_path": str(video_path) if video_path else None,
+            "n_frames": len(frames),
+        }
+
+
+    def eval_checkpoint(ckpt_path: str, sim: SimClient, mapper: G1JointMapper, ckpt_name: str):
+        """Evaluate one GR00T checkpoint across N episodes."""
+        import torch
+
+        print(f"\n[eval] Loading GR00T policy from {ckpt_path}")
+        policy = Gr00tPolicy(
+            embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+            model_path=ckpt_path,
+            device="cuda:0",
+        )
+        print(f"[eval] Policy loaded. Running {N_EPISODES} episodes...")
+
+        video_dir = VIDEO_DIR / ckpt_name
+        results = []
+
+        for ep in range(N_EPISODES):
+            metrics = run_episode(policy, sim, mapper, ep, video_dir)
+            results.append(metrics)
+            print(f"  [ep {ep}] reward={metrics['total_reward']:.3f}, "
+                  f"length={metrics['episode_length']}, "
+                  f"terminated={metrics['terminated']}")
+
+        # Free GPU memory
+        del policy
+        torch.cuda.empty_cache()
+
+        return results
+
+
+    def log_to_wandb(run, ckpt_name: str, trial_name: str, results: list, metadata: dict):
+        """Log evaluation results to W&B."""
+        rewards = [r["total_reward"] for r in results]
+        lengths = [r["episode_length"] for r in results]
+        terminated = [r["terminated"] for r in results]
+
+        # Summary scalars
+        wandb.log({
+            "eval/mean_reward": float(np.mean(rewards)),
+            "eval/mean_episode_length": float(np.mean(lengths)),
+            "eval/termination_rate": float(np.mean(terminated)),
+        })
+
+        # Metrics table
+        table = wandb.Table(columns=[
+            "checkpoint", "trial", "episode", "total_reward", "episode_length", "terminated",
+        ])
+        for ep_idx, r in enumerate(results):
+            table.add_data(ckpt_name, trial_name, ep_idx,
+                          r["total_reward"], r["episode_length"], r["terminated"])
+        wandb.log({"eval/metrics": table})
+
+        # Rollout videos — all under one "eval/rollout" key for a single panel
+        for ep_idx, r in enumerate(results):
+            if r["video_path"] and os.path.exists(r["video_path"]):
+                try:
+                    vid = wandb.Video(r["video_path"], format="mp4", fps=20,
+                                      caption=f"{ckpt_name} ep{ep_idx}")
+                    wandb.log({"eval/rollout": vid})
+                except Exception as e:
+                    print(f"[eval] WARN: video upload failed for ep {ep_idx}: {e}")
+
+        # Run summary
+        run.summary["eval/mean_reward"] = float(np.mean(rewards))
+        run.summary["eval/mean_episode_length"] = float(np.mean(lengths))
+        run.summary["eval/termination_rate"] = float(np.mean(terminated))
+        run.summary["eval/n_episodes"] = N_EPISODES
+        run.summary["eval/checkpoint"] = ckpt_name
+        run.summary["eval/training_loss"] = metadata.get("best_loss", "N/A")
+        run.summary["status"] = "success"
+
+        print(f"[eval] {trial_name}: mean_reward={np.mean(rewards):.3f}, "
+              f"mean_length={np.mean(lengths):.1f}, "
+              f"termination_rate={np.mean(terminated):.2f}")
+
+
+    def main():
+        print("=" * 60)
+        print("[eval] GR00T Isaac Lab Closed-Loop Evaluation")
+        print(f"[eval] Entity: {ENTITY}, Project: {PROJECT}")
+        print(f"[eval] Episodes: {N_EPISODES}, Max steps: {MAX_STEPS}")
+        print(f"[eval] Task: {TASK_DESC}")
+        print("=" * 60)
+
+        # Connect to sim
+        sim = SimClient(SIM_ADDR)
+        spec = sim.get_spec()
+        print(f"[eval] Sim spec: proprio_dim={spec['proprio_dim']}, action_dim={spec['action_dim']}")
+
+        # Get joint names for mapping
+        joint_names = sim.get_joint_names()
+        if not joint_names:
+            print("[eval] WARN: No joint names from sim. Using spec-based fallback.")
+            # Create dummy joint names for flat vector mapping
+            joint_names = [f"joint_{i}" for i in range(spec["action_dim"])]
+
+        mapper = G1JointMapper(joint_names)
+
+        # Query W&B for sweep trial artifacts (retry with backoff if none found yet)
+        max_wait = int(os.environ.get("ARTIFACT_WAIT_MINUTES", "60"))
+        poll_interval = 60  # seconds
+        trial_artifacts = []
+
+        for attempt in range(max(1, max_wait)):
+            api = wandb.Api()
+            trial_artifacts = []
+            try:
+                for col in api.artifact_type("model", f"{ENTITY}/{PROJECT}").collections():
+                    if "groot-bc-g1-trial" in col.name:
+                        for art in col.artifacts():
+                            trial_artifacts.append(art)
+            except Exception as e:
+                print(f"[eval] Error querying artifacts: {e}")
+
+            if trial_artifacts:
+                break
+
+            # Check for local checkpoint as fallback
+            local_ckpt = os.environ.get("LOCAL_CHECKPOINT")
+            if local_ckpt and os.path.exists(local_ckpt):
+                print(f"[eval] Using local checkpoint: {local_ckpt}")
+                run = wandb.init(
+                    entity=ENTITY, project=PROJECT,
+                    name="isaaclab-eval-local",
+                    job_type="isaaclab-eval",
+                    config={"n_episodes": N_EPISODES, "max_steps": MAX_STEPS, "task": TASK_DESC},
+                )
+                results = eval_checkpoint(local_ckpt, sim, mapper, "local")
+                log_to_wandb(run, "local", "local", results, {})
+                wandb.finish()
+                return
+
+            print(f"[eval] No artifacts found yet. Waiting {poll_interval}s... "
+                  f"(attempt {attempt+1}/{max_wait})")
+            time.sleep(poll_interval)
+
+        if not trial_artifacts:
+            print(f"[eval] No groot-bc-g1-trial artifacts found after {max_wait} min. "
+                  "Sleeping indefinitely (scale down manually).")
+            while True:
+                time.sleep(3600)
+            return
+
+        # Track evaluated artifacts to avoid duplicates
+        evaluated_file = Path("/workspace/eval_artifacts/.evaluated")
+        evaluated_set = set()
+        if evaluated_file.exists():
+            evaluated_set = set(evaluated_file.read_text().strip().split("\n"))
+
+        def eval_artifacts(trial_artifacts, sim, mapper):
+            """Evaluate new (unevaluated) artifacts. Returns count of newly evaluated."""
+            nonlocal evaluated_set
+            new_count = 0
+            for i, artifact in enumerate(trial_artifacts):
+                art_key = f"{artifact.name}:{artifact.version}"
+                if art_key in evaluated_set:
+                    print(f"[eval] Skipping already-evaluated: {art_key}")
+                    continue
+
+                meta = artifact.metadata or {}
+                trial_name = meta.get("trial_name", f"trial-{i}")
+                best_loss = meta.get("best_loss", "N/A")
+
+                print(f"\n{'=' * 60}")
+                print(f"[eval] [{i+1}/{len(trial_artifacts)}] {artifact.name}")
+                print(f"[eval] Trial: {trial_name}, Training loss: {best_loss}")
+                print(f"{'=' * 60}")
+
+                # Download checkpoint
+                ckpt_dir = artifact.download(root=f"/workspace/eval_artifacts/{artifact.name}")
+                model_dir = os.path.join(ckpt_dir, "model")
+                if not os.path.exists(os.path.join(model_dir, "config.json")):
+                    model_dir = ckpt_dir
+
+                # Resume the ORIGINAL sweep run to log eval under the same run
+                source_run_id = meta.get("run_id")
+                if not source_run_id:
+                    try:
+                        source_run = artifact.logged_by()
+                        source_run_id = source_run.id
+                        print(f"[eval] Got run_id from artifact.logged_by(): {source_run_id}")
+                    except Exception as e:
+                        print(f"[eval] Could not get source run: {e}")
+
+                # Run eval FIRST (doesn't need W&B)
+                ckpt_name = meta.get("checkpoint", artifact.name.split(":")[0])
+                try:
+                    results = eval_checkpoint(model_dir, sim, mapper, ckpt_name)
+                except Exception as e:
+                    print(f"[eval] ERROR during rollout: {e}")
+                    import traceback; traceback.print_exc()
+                    results = None
+
+                # Then try to log to W&B
+                if results is not None:
+                    run = None
+                    try:
+                        if source_run_id:
+                            print(f"[eval] Resuming original run: {source_run_id} ({trial_name})")
+                            run = wandb.init(
+                                entity=ENTITY, project=PROJECT,
+                                id=source_run_id,
+                                resume="allow",
+                                settings=wandb.Settings(init_timeout=120),
+                            )
+                        else:
+                            run = wandb.init(
+                                entity=ENTITY, project=PROJECT,
+                                name=f"isaaclab-eval-{trial_name}",
+                                job_type="isaaclab-eval",
+                                settings=wandb.Settings(init_timeout=120),
+                            )
+                        log_to_wandb(run, ckpt_name, trial_name, results, meta)
+                    except Exception as e:
+                        print(f"[eval] WARN: W&B logging failed: {e}")
+                        print(f"[eval] Videos saved locally at /shared/eval_videos/{ckpt_name}/")
+                    finally:
+                        try:
+                            wandb.finish(quiet=True)
+                        except Exception:
+                            pass
+
+                # Mark as evaluated
+                evaluated_set.add(art_key)
+                evaluated_file.parent.mkdir(parents=True, exist_ok=True)
+                evaluated_file.write_text("\n".join(sorted(evaluated_set)))
+
+                # Clean up downloaded artifact
+                shutil.rmtree(f"/workspace/eval_artifacts/{artifact.name}", ignore_errors=True)
+                new_count += 1
+            return new_count
+
+        # Initial evaluation
+        print(f"[eval] Found {len(trial_artifacts)} checkpoint artifact(s)")
+        eval_artifacts(trial_artifacts, sim, mapper)
+
+        # Poll for new artifacts (sweep may produce more over time)
+        poll_minutes = int(os.environ.get("POLL_MINUTES", "10"))
+        print(f"\n[eval] Initial batch done. Polling for new artifacts every {poll_minutes} min...")
+        while True:
+            time.sleep(poll_minutes * 60)
+            api = wandb.Api()
+            trial_artifacts = []
+            try:
+                for col in api.artifact_type("model", f"{ENTITY}/{PROJECT}").collections():
+                    if "groot-bc-g1-trial" in col.name:
+                        for art in col.artifacts():
+                            trial_artifacts.append(art)
+            except Exception as e:
+                print(f"[eval] Poll error: {e}")
+                continue
+            n_new = eval_artifacts(trial_artifacts, sim, mapper)
+            if n_new > 0:
+                print(f"[eval] Evaluated {n_new} new checkpoint(s).")
+            else:
+                print(f"[eval] No new checkpoints. {len(evaluated_set)} already evaluated. Waiting...")
+
+
+    if __name__ == "__main__":
+        main()
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: groot-isaaclab-eval
+spec:
+  clusterIP: None
+  selector:
+    app: groot-isaaclab-eval
+  ports:
+    - name: grpc
+      port: 7000
+      targetPort: 7000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: groot-isaaclab-eval
+spec:
+  serviceName: groot-isaaclab-eval
+  replicas: 1
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: groot-isaaclab-eval
+  template:
+    metadata:
+      labels:
+        app: groot-isaaclab-eval
+    spec:
+      volumes:
+        - name: sim-scripts
+          configMap:
+            name: groot-eval-sim-scripts
+            defaultMode: 0755
+        - name: eval-scripts
+          configMap:
+            name: groot-eval-client-scripts
+            defaultMode: 0755
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: shared
+          emptyDir:
+            sizeLimit: 200Gi
+      containers:
+        # ---- Isaac Lab Simulation Container ----
+        - name: sim
+          image: nvcr.io/nvidia/isaac-lab:2.3.2
+          command: ["/bin/bash", "/scripts/sim_entrypoint.sh"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: ISAAC_TASK
+              value: Isaac-G1-ManipJointCtrl-v0
+            - name: VIDEO_EVERY
+              value: "1"
+            - name: VIDEO_DIR
+              value: /shared/videos
+            - name: SIM_RPC_PORT
+              value: "7000"
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              cpu: "16"
+              memory: 64Gi
+            requests:
+              nvidia.com/gpu: 1
+              cpu: "8"
+              memory: 32Gi
+          volumeMounts:
+            - name: sim-scripts
+              mountPath: /scripts
+            - name: shm
+              mountPath: /dev/shm
+            - name: shared
+              mountPath: /shared
+        # ---- GR00T Evaluation Container ----
+        - name: eval
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+          command: ["/bin/bash", "/scripts/eval_entrypoint.sh"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SIM_RPC_ADDR
+              value: 127.0.0.1:7000
+            # ---- W&B ----
+            - name: WANDB_ENTITY
+              value: wandb-smle
+            - name: WANDB_PROJECT
+              value: isaacsim-nvidia-vla-crwv
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-api-key
+                  key: WANDB_API_KEY
+            # ---- Eval Config ----
+            - name: N_EPISODES
+              value: "3"
+            - name: MAX_EPISODE_STEPS
+              value: "3000"
+            - name: TASK_DESCRIPTION
+              value: "Pick up the apple and place it on the plate"
+            - name: VIDEO_DIR
+              value: /shared/eval_videos
+            # ---- CUDA ----
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: expandable_segments:True
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              cpu: "32"
+              memory: 128Gi
+            requests:
+              nvidia.com/gpu: 1
+              cpu: "16"
+              memory: 64Gi
+          volumeMounts:
+            - name: eval-scripts
+              mountPath: /scripts
+            - name: shared
+              mountPath: /shared

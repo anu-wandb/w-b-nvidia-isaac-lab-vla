@@ -1,210 +1,361 @@
-<p align="center">
-  <img src="./assets/nvidia-isaac.webp" width="400" alt="NVIDIA Isaac Lab" style="vertical-align: middle;" />
-  &nbsp;&nbsp;&nbsp;&nbsp;
-  <img src="./assets/Endorsed_primary_goldwhite.png#gh-dark-mode-only" width="600" alt="Weights & Biases" style="vertical-align: middle;" />
-  <img src="./assets/Endorsed_primary_goldblack.png#gh-light-mode-only" width="600" alt="Weights & Biases" style="vertical-align: middle;" />
-</p>
+# Fine-Tuning GR00T N1.6 VLA with Isaac Lab Closed-Loop Evaluation on Kubernetes
 
-# Running NVIDIA Isaac Lab for Reinforcement Learning on Kubernetes with Weights & Biases Tracking
-
-This guide explains how to run distributed NVIDIA Isaac Lab training on
-a Kubernetes GPU cluster using the provided StatefulSet YAML
-configuration. We are using a L40 (2 nodes x 4 GPU cluster from Coreweave here, please update the hardware configs to match your cluster)
+This guide explains how to run an end-to-end **Behavioral Cloning (BC) sweep + Isaac Lab closed-loop evaluation** pipeline for NVIDIA's GR00T N1.6-3B Vision-Language-Action model on a Kubernetes GPU cluster with Weights & Biases tracking.
 
 This setup supports:
 
--   Multi-node distributed training (2 nodes × 4 GPUs each)
--   Headless Isaac Sim execution
--   Automatic Weights & Biases (W&B) logging
--   Artifact tracking
--   Checkpoint and video upload after training
--   Persistent shared storage for logs and models
+- Bayesian hyperparameter sweep for BC fine-tuning (8× L40 GPUs)
+- Automated closed-loop evaluation in Isaac Lab simulation (2× L40 GPUs)
+- Two-container pod architecture (sim + eval) with gRPC communication
+- Automatic W&B logging: training curves, rollout videos, model artifacts
+- Continuous evaluation: new checkpoints are picked up and evaluated automatically
 
+## See this pipeline running live on W&B: [GR00T VLA + Isaac Lab on CoreWeave](https://wandb.ai/wandb-smle/isaacsim-nvidia-vla-crwv)
 
-<p align="center">
-  <img src="./assets/W&B_Demo_gif.gif" alt="Weights & Biases" />
-</p>
-
-## See this blueprint running live on W&B: [Isaac Lab + W&B on Coreweave](https://wandb.ai/wandb-smle/isaaclab-wandb-crwv?nw=nwuseranushravvatsa)
-
-------------------------------------------------------------------------
+---
 
 # Documentation References
 
--   Isaac Lab GitHub
-    https://github.com/isaac-sim/IsaacLab
+- GR00T (Isaac-GR00T) https://github.com/NVIDIA/Isaac-GR00T
+- Isaac Lab https://github.com/isaac-sim/IsaacLab
+- Isaac Sim https://docs.omniverse.nvidia.com/isaacsim/latest/index.html
+- Weights & Biases https://docs.wandb.ai
+- Kubernetes https://kubernetes.io/docs/home/
+- NVIDIA NGC https://ngc.nvidia.com
 
--   Isaac Sim Documentation
-    https://docs.omniverse.nvidia.com/isaacsim/latest/index.html
-
--   Weights & Biases Documentation
-    https://docs.wandb.ai
-
--   Kubernetes Documentation
-    https://kubernetes.io/docs/home/
-
--   NVIDIA NGC (Container Registry)
-    https://ngc.nvidia.com
-
-------------------------------------------------------------------------
+---
 
 # Architecture Overview
 
-The provided YAML deploys:
+The pipeline has two stages that run concurrently on separate pods:
 
--   A StatefulSet with 2 replicas
--   4 GPUs per pod
--   torch.distributed multi-node training
--   Headless Isaac Sim
--   A 400Gi PersistentVolumeClaim (ReadWriteMany)
--   Automatic W&B artifact download before training
--   Automatic checkpoint + video upload after training
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     BC Sweep Training Pod                          │
+│                     groot-bc-g1-0 (8× L40)                        │
+│                                                                     │
+│  wandb.agent (Bayesian sweep)                                       │
+│    ├── Trial 1: lr=1.09e-4, grad_accum=64, steps=20000             │
+│    ├── Trial 2: lr=2.3e-4,  grad_accum=32, steps=15000             │
+│    └── ...                                                          │
+│                                                                     │
+│  Each trial:                                                        │
+│    1. Fine-tune GR00T N1.6-3B on 311 G1 teleop episodes            │
+│    2. Upload best checkpoint as W&B artifact (groot-bc-g1-trial)    │
+└────────────────────────┬────────────────────────────────────────────┘
+                         │ W&B Artifacts
+                         ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│               Isaac Lab Evaluation Pod                              │
+│               groot-isaaclab-eval-0 (2× L40)                        │
+│                                                                     │
+│  ┌──────────────────┐    gRPC    ┌────────────────────────┐         │
+│  │  Sim Container   │◄─────────►│   Eval Container       │         │
+│  │  (Isaac Lab 2.3.2)│  :7000    │   (GR00T + eval)       │         │
+│  │                  │            │                        │         │
+│  │  G1 robot        │  obs/act   │  Poll W&B for new      │         │
+│  │  + table + cube  │◄──────────►│  groot-bc-g1-trial     │         │
+│  │  + camera        │            │  artifacts             │         │
+│  │                  │            │                        │         │
+│  │  JointPosition   │            │  Load GR00T policy     │         │
+│  │  ActionCfg       │            │  Run 3 rollout eps     │         │
+│  │                  │            │  Log videos to W&B     │         │
+│  └──────────────────┘            └────────────────────────┘         │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-Training task:
+### Key Design Decisions
 
-    Isaac-Dexsuite-Kuka-Allegro-Lift-v0
+- **Two-container pods**: Isaac Lab requires Python 3.11 (bundled in `nvcr.io/nvidia/isaac-lab:2.3.2`), while GR00T requires Python 3.10. The containers share a pod and communicate over localhost gRPC.
+- **Fixed-base robot**: The G1 robot's root link is fixed (`fix_root_link = True`) for tabletop manipulation evaluation.
+- **Joint position control**: GR00T outputs per-body-part joint positions/deltas, which are mapped to Isaac Lab's flat 37-DOF action space via `G1JointMapper`.
+- **RELATIVE vs ABSOLUTE actions**: Arms and legs use relative (delta) actions, while waist and hands use absolute targets. The mapper converts relative deltas to absolute positions by adding them to the current joint state.
 
-Other avaialble tasks and enviroments that ship with Isaac Sim: https://isaac-sim.github.io/IsaacLab/main/source/overview/environments.html
-
-------------------------------------------------------------------------
+---
 
 # 1. Prerequisites
 
-## Select the Correct Kubernetes Context for your cluster
+## Kubernetes Cluster
 
-``` bash
+A GPU cluster with NVIDIA L40 (or equivalent) GPUs. This guide uses CoreWeave.
+
+```bash
 kubectl config get-contexts
 kubectl config use-context <your-cluster-context>
 ```
 
-------------------------------------------------------------------------
+## NVIDIA NGC Access
 
-# 2. NVIDIA Container Registry (NGC) Setup
+Container image: `nvcr.io/nvidia/isaac-lab:2.3.2`
 
-Container image used:
-
-    nvcr.io/nvidia/isaac-lab:2.3.2
-
-Create an NGC account:
-
-https://ngc.nvidia.com
-
-Generate an NGC API key and create a Kubernetes image pull secret:
-
-``` bash
-kubectl create secret docker-registry nvcr-secret   --docker-server=nvcr.io   --docker-username='$oauthtoken'   --docker-password='<YOUR_NGC_API_KEY>'  
+```bash
+kubectl create secret docker-registry nvcr-secret \
+  --docker-server=nvcr.io \
+  --docker-username='$oauthtoken' \
+  --docker-password='<YOUR_NGC_API_KEY>'
 ```
 
-If required, add to your pod spec:
+## Weights & Biases Setup
 
-``` yaml
-imagePullSecrets:
-  - name: nvcr-secret
+```bash
+kubectl create secret generic wandb-api-key \
+  --from-literal=WANDB_API_KEY=<YOUR_WANDB_API_KEY>
 ```
 
-------------------------------------------------------------------------
+## Base Model
 
-# 3. Weights & Biases Setup
+Upload the GR00T N1.6-3B base model as a W&B artifact:
 
-Create a W&B account:
-
-https://wandb.ai
-
-Generate an API key:
-
-https://wandb.ai/authorize
-
-Store it as a Kubernetes secret:
-
-``` bash
-kubectl create secret generic wandb-api-key   --from-literal=WANDB_API_KEY=<YOUR_WANDB_API_KEY>
+```
+wandb-smle/isaacsim-nvidia-vla-crwv/groot-n1.6-3b:v1
 ```
 
-Referenced in YAML as:
+## Teleop Dataset
 
-``` yaml
-- name: WANDB_API_KEY
-  valueFrom:
-    secretKeyRef:
-      name: wandb-api-key
-      key: WANDB_API_KEY
+Upload the G1 teleop dataset (311 episodes) as a W&B artifact:
+
+```
+wandb-smle/isaacsim-nvidia-vla-crwv/groot-teleop-unitree-g1:v0
 ```
 
-------------------------------------------------------------------------
+---
 
-# 4. Running Training
+# 2. Running the Pipeline
 
-Three workload configurations are available:
+## Stage 1: BC Sweep Training
 
-### Training Only
+Launches a Bayesian hyperparameter sweep that fine-tunes GR00T on G1 teleop data.
 
-Runs distributed training with no W&B tracking or artifact uploads — useful for validating that training starts and runs correctly on your cluster.
-
-``` bash
-kubectl apply -f isaaclab-workload-only-train.yaml
+```bash
+kubectl apply -f groot-bc-unitree-g1.yaml
 ```
 
-### End-to-End Test
+This creates a single pod (`groot-bc-g1-0`) with 8× L40 GPUs running DDP training. The sweep explores:
 
-Runs the full pipeline (training, W&B tracking, checkpoint and video upload) at minimal scale (3 iterations, 32 envs, 1 GPU per node) as a smoke test.
+| Parameter | Range |
+|-----------|-------|
+| Learning rate | 5e-5 — 3e-4 |
+| Gradient accumulation | 16, 32, 64 |
+| Max training steps | 10,000 — 30,000 |
 
-``` bash
-kubectl apply -f isaaclab-workload-end-to-end-test.yaml
+Each trial:
+1. Fine-tunes GR00T N1.6-3B with LoRA (PEFT)
+2. Logs training loss to W&B
+3. Uploads the best checkpoint as artifact `groot-bc-g1-trial`
+
+## Stage 2: Isaac Lab Closed-Loop Evaluation
+
+Automatically evaluates every BC checkpoint in simulation.
+
+```bash
+kubectl apply -f groot-isaaclab-eval.yaml
 ```
 
-### Full Training
+This creates a two-container pod (`groot-isaaclab-eval-0`) with 2× L40 GPUs:
 
-Runs the complete pipeline at full scale (4 GPUs/node, 1500 iterations, 8192 envs) with W&B tracking and artifact uploads.
+- **Sim container** (GPU 0): Runs Isaac Lab with the `Isaac-G1-ManipJointCtrl-v0` environment — a Unitree G1 robot at a table with a red cube
+- **Eval container** (GPU 1): Polls W&B for new `groot-bc-g1-trial` artifacts, downloads each checkpoint, runs 3 rollout episodes (3000 steps each), and logs videos + metrics back to W&B
 
-``` bash
-kubectl apply -f isaaclab-workload-max.yaml
-```
+The eval loop runs continuously — as the BC sweep produces new checkpoints, they are automatically picked up and evaluated.
 
-### Monitoring
+---
 
-Check pods:
+# 3. Monitoring
 
-``` bash
+## Pod Status
+
+```bash
 kubectl get pods
 ```
 
-View logs:
-
-``` bash
-kubectl logs -f isaaclab-workers-0
-kubectl logs -f isaaclab-workers-1
+Expected output:
+```
+NAME                    READY   STATUS    AGE
+groot-bc-g1-0           1/1     Running   10d
+groot-isaaclab-eval-0   2/2     Running   4d
 ```
 
-Currently W&B logging is enabled from node rank 0 only. W&B also supports logging from all nodes if needed.
+## Logs
 
-------------------------------------------------------------------------
+```bash
+# BC sweep training
+kubectl logs groot-bc-g1-0 --tail=20
 
-# 5. Cleanup
+# Eval — sim container
+kubectl logs groot-isaaclab-eval-0 -c sim --tail=20
 
-Delete deployment:
-
-``` bash
-kubectl delete -f <your-workload-file>.yaml
+# Eval — eval container
+kubectl logs groot-isaaclab-eval-0 -c eval --tail=20
 ```
 
-Delete PVC (optional):
+## W&B Dashboard
 
-``` bash
-kubectl delete pvc isaaclab-logs-pvc
+- **Project**: [`wandb-smle/isaacsim-nvidia-vla-crwv`](https://wandb.ai/wandb-smle/isaacsim-nvidia-vla-crwv)
+- **Sweep runs**: Training loss curves for each trial
+- **Eval metrics** (logged to each trial's original run):
+  - `eval/mean_reward` — mean episode reward
+  - `eval/mean_episode_length` — mean episode length
+  - `eval/termination_rate` — fraction of episodes terminated early
+  - `eval/checkpoint` — which checkpoint was evaluated
+  - Rollout videos attached as `wandb.Video` media
+
+---
+
+# 4. How It Works
+
+## BC Training Pipeline
+
+1. `wandb.agent` starts a Bayesian sweep
+2. Each trial runs `launch_finetune.py` from the Isaac-GR00T repo
+3. Training uses DDP across 8 GPUs with gradient checkpointing
+4. The `flash_attn` library is patched to use `sdpa` (L40 GPUs lack flash_attn_2)
+5. Best checkpoint is uploaded as a W&B artifact
+
+## Evaluation Pipeline
+
+1. Eval container polls W&B for new `groot-bc-g1-trial` artifacts
+2. Downloads the checkpoint and loads `Gr00tPolicy`
+3. For each episode:
+   - Sim resets the environment (G1 robot + table + cube)
+   - At each step: `obs → G1JointMapper.obs_to_groot() → policy.get_action() → G1JointMapper.action_chunk_from_groot(actions, current_proprio) → sim.step()`
+   - The mapper handles the RELATIVE/ABSOLUTE action split: arm and leg deltas are added to current joint positions before being sent as absolute targets
+   - Camera frames are collected for video
+4. Videos and metrics are logged back to the original sweep trial's W&B run
+
+## GR00T Model Details
+
+- **Architecture**: EagleBackbone (vision-language encoder) + DiT action head (flow matching)
+- **Action head**: Flow matching with linear interpolation (`x_t = (1-t)*noise + t*actions`), velocity prediction, Euler integration at inference
+- **Action horizon**: 16 timesteps per query
+- **Custom embodiment**: Registered as `NEW_EMBODIMENT` via `register_modality_config()`
+
+## G1 Robot Joint Mapping
+
+The GR00T model was trained on 43-DOF teleop data, but Isaac Lab's G1 has 37 DOFs:
+
+| Body Part | Training DOFs | Sim DOFs | Padding | Action Type |
+|-----------|--------------|----------|---------|-------------|
+| waist | 3 | 1 | 1→3 | ABSOLUTE |
+| left_arm | 7 | 5 | 5→7 | RELATIVE |
+| right_arm | 7 | 5 | 5→7 | RELATIVE |
+| left_hand | 7 | 7 | — | ABSOLUTE |
+| right_hand | 7 | 7 | — | ABSOLUTE |
+| left_leg | 6 | 6 | — | RELATIVE |
+| right_leg | 6 | 6 | — | RELATIVE |
+
+`G1JointMapper` handles the padding (state) and trimming (actions) automatically.
+
+---
+
+# 5. Configuration
+
+## BC Sweep (`groot-bc-unitree-g1.yaml`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WANDB_ENTITY` | `wandb-smle` | W&B entity |
+| `WANDB_PROJECT` | `isaacsim-nvidia-vla-crwv` | W&B project |
+| `BASE_MODEL_ARTIFACT` | `groot-n1.6-3b:v1` | Base GR00T model |
+| `DATASET_ARTIFACT` | `groot-teleop-unitree-g1:v0` | Teleop training data |
+| GPU allocation | 8× L40 | DDP training |
+
+## Eval (`groot-isaaclab-eval.yaml`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ISAAC_TASK` | `Isaac-G1-ManipJointCtrl-v0` | Isaac Lab environment |
+| `TASK_DESCRIPTION` | `Pick up the apple and place it on the plate` | Language prompt |
+| `N_EPISODES` | `3` | Rollout episodes per checkpoint |
+| `MAX_STEPS` | `3000` | Max steps per episode |
+| Sim GPU | 1× L40 | Isaac Lab simulation |
+| Eval GPU | 1× L40 | GR00T inference |
+
+---
+
+# 6. Cleanup
+
+```bash
+# Stop the BC sweep
+kubectl delete -f groot-bc-unitree-g1.yaml
+
+# Stop the eval pipeline
+kubectl delete -f groot-isaaclab-eval.yaml
+
+# Or scale down without deleting (preserves config)
+kubectl scale statefulset groot-bc-g1 --replicas=0
+kubectl scale statefulset groot-isaaclab-eval --replicas=0
 ```
 
-------------------------------------------------------------------------
+---
 
-# Workflow Summary:
+# 7. Files
 
-1.  Select cluster context
-2.  Ensure NGC secret exists
-3.  Ensure W&B secret exists
-4.  Apply YAML
-5.  Monitor logs
+| File | Description |
+|------|-------------|
+| [`groot-bc-unitree-g1.yaml`](groot-bc-unitree-g1.yaml) | BC sweep training (8× L40) |
+| [`groot-isaaclab-eval.yaml`](groot-isaaclab-eval.yaml) | Isaac Lab closed-loop eval (2× L40) |
+| [`groot-rft-g1.yaml`](groot-rft-g1.yaml) | GRPO/ReST reinforcement finetuning (not active) |
+| [`groot-rft-two-container.yaml`](groot-rft-two-container.yaml) | Original RFT reference (MLP policy, not GR00T) |
 
-Training runs distributed across 8 GPUs. 
-Training is being tracked in Weights &
-Biases.
-Checkpoints and videos upload automatically to Weights &
-Biases.
+---
+
+# 8. Troubleshooting
+
+### Pod not starting
+
+```bash
+kubectl describe pod groot-bc-g1-0
+```
+
+Common issues:
+- GPU resources not available → check node GPU allocation
+- Image pull errors → verify NGC secret exists
+- W&B secret missing → create `wandb-api-key` secret
+
+### Eval not picking up new checkpoints
+
+The eval container tracks evaluated artifacts in memory (cleared on pod restart). If checkpoints are being skipped:
+
+```bash
+# Restart to re-evaluate all checkpoints
+kubectl delete pod groot-isaaclab-eval-0
+```
+
+### W&B timeout from cluster
+
+CoreWeave nodes can have intermittent W&B connectivity. The eval pipeline handles this gracefully — it runs rollouts first, then attempts W&B logging. Videos are saved locally even if W&B fails.
+
+### flash_attn errors
+
+L40 GPUs don't support `flash_attn_2`. The entrypoint scripts automatically patch Eagle backbone to use `sdpa` and create a `flash_attn` stub package.
+
+### Robot not moving in rollouts
+
+Verify the RELATIVE→ABSOLUTE action conversion is active. Check eval logs for:
+
+```
+RELATIVE parts (delta→absolute): {'left_arm', 'left_leg', 'right_arm', 'right_leg'}
+ABSOLUTE parts (direct target): {'waist', 'left_hand', 'right_hand'}
+```
+
+If missing, the `g1_joint_mapper.py` needs the `RELATIVE_PARTS`/`ABSOLUTE_PARTS` constants and the `current_proprio` parameter in `action_chunk_from_groot()`.
+
+---
+
+# Workflow Summary
+
+1. Apply BC sweep YAML → starts hyperparameter search
+2. Apply eval YAML → starts polling for checkpoints
+3. As each sweep trial completes, it uploads a checkpoint artifact to W&B
+4. The eval pod downloads the checkpoint, runs 3 rollout episodes in Isaac Lab, and logs videos + metrics back to W&B
+5. Monitor everything in the W&B dashboard
+
+---
+
+# References
+
+- GR00T N1.6: https://github.com/NVIDIA/Isaac-GR00T
+- Isaac Lab: https://isaac-sim.github.io/IsaacLab/
+- Isaac Sim: https://docs.omniverse.nvidia.com/isaacsim/latest/
+- Weights & Biases: https://docs.wandb.ai/
+- CoreWeave Kubernetes: https://docs.coreweave.com/
