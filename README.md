@@ -16,7 +16,7 @@ This setup supports:
 - Automatic W&B logging: training curves, rollout videos, model artifacts
 - Continuous evaluation: new checkpoints are picked up and evaluated automatically
 
-## See this pipeline running live on W&B: [GR00T VLA + Isaac Lab on CoreWeave](https://wandb.ai/wandb-smle/isaacsim-nvidia-vla-crwv)
+## See this pipeline running live on W&B: [GR00T VLA + Isaac Lab on CoreWeave](https://wandb.ai/wandb-smle/isaacsim-nvidia-vla-crwv/sweeps/v2aohfof?nw=sxt5zec5kh)
 
 <p align="center">
   <img src="./assets/W&B_Demo.gif" alt="W&B Dashboard Demo" width="800" />
