@@ -1,6 +1,5 @@
 <p align="center">
   <img src="./assets/nvidia-isaac.webp" width="400" alt="NVIDIA Isaac Lab" style="vertical-align: middle;" />
-  &nbsp;&nbsp;&nbsp;&nbsp;
   <img src="./assets/Endorsed_primary_goldwhite.png#gh-dark-mode-only" width="600" alt="Weights & Biases" style="vertical-align: middle;" />
   <img src="./assets/Endorsed_primary_goldblack.png#gh-light-mode-only" width="600" alt="Weights & Biases" style="vertical-align: middle;" />
 </p>
@@ -127,11 +126,19 @@ python upload_inputs.py --entity <YOUR_WANDB_ENTITY> --project <YOUR_WANDB_PROJE
 
 This will download ~15 GB of model weights and ~2 GB of teleop data, then upload them as versioned W&B artifacts. You can skip either with `--skip-model` or `--skip-dataset` if already uploaded.
 
+You can follow the links provided by WandB SDK or go to your workspace and navigate to `Artifacts` -> `Models/Datasets`-> `Versions`
+
+<p align="center">
+  <img src="./assets/find_assests_after_upload.png" alt="W&B Dashboard Demo" width="800" />
+</p>
+
+Grab the `Full Name` for these artifacts. We will need to map these in our script later to use them as inputs to our training.  
+
 ---
 
 # Running the Pipeline
 
-## Stage 1: BC Sweep Training
+## Stage 1: Setup Hyperparameter Sweep for VLA Finetuning
 
 Launches a Bayesian hyperparameter sweep that fine-tunes GR00T on G1 teleop data.
 
@@ -148,13 +155,14 @@ This creates a single pod (`groot-bc-g1-0`) with 8× L40 GPUs running DDP traini
 | Max training steps | 10,000 — 30,000 |
 
 Each trial:
-1. Fine-tunes GR00T N1.6-3B with LoRA (PEFT)
-2. Logs training loss to W&B
-3. Uploads the best checkpoint as artifact `groot-bc-g1-trial`
+1. Fine-tunes GR00T N1.6-3B with LoRA (PEFT) for memory efficiency during training
+2. Saves fully merged weight checkpoints (not adapter-only) — the eval pod can load these directly without needing the base model
+3. Logs training loss to W&B
+4. Uploads the best checkpoint as artifact `groot-bc-g1-trial`
 
 ## Stage 2: Isaac Lab Closed-Loop Evaluation
 
-Automatically evaluates every BC checkpoint in simulation.
+Automatically evaluates every checkpoint in simulation.
 
 ```bash
 kubectl apply -f groot-isaaclab-eval.yaml
@@ -165,11 +173,11 @@ This creates a two-container pod (`groot-isaaclab-eval-0`) with 2× L40 GPUs:
 - **Sim container** (GPU 0): Runs Isaac Lab with the `Isaac-G1-ManipJointCtrl-v0` environment — a Unitree G1 robot at a table with a red cube
 - **Eval container** (GPU 1): Polls W&B for new `groot-bc-g1-trial` artifacts, downloads each checkpoint, runs 3 rollout episodes (3000 steps each), and logs videos + metrics back to W&B
 
-The eval loop runs continuously — as the BC sweep produces new checkpoints, they are automatically picked up and evaluated.
+The eval loop runs continuously — as the training produces new checkpoints, they are automatically picked up and evaluated.
 
 ---
 
-# Monitoring
+# View Logs
 
 ## Pod Status
 
@@ -197,6 +205,8 @@ kubectl logs groot-isaaclab-eval-0 -c sim --tail=20
 kubectl logs groot-isaaclab-eval-0 -c eval --tail=20
 ```
 
+# Monitoring Training 
+
 ## W&B Dashboard
 
 - **Project**: [`wandb-smle/isaacsim-nvidia-vla-crwv`](https://wandb.ai/wandb-smle/isaacsim-nvidia-vla-crwv)
@@ -212,7 +222,7 @@ kubectl logs groot-isaaclab-eval-0 -c eval --tail=20
 
 # Configuration
 
-## BC Sweep (`groot-bc-unitree-g1.yaml`)
+## Hyperparameter Sweep (`groot-bc-unitree-g1.yaml`)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
