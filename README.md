@@ -22,46 +22,6 @@ This setup supports:
   <img src="./assets/W&B_Demo.gif" alt="W&B Dashboard Demo" width="800" />
 </p>
 
----
-
-# Quickstart
-
-
-# 1. Upload base model + dataset to W&B
-```bash
-pip install wandb huggingface_hub
-python upload_inputs.py --entity <YOUR_WANDB_ENTITY> --project <YOUR_WANDB_PROJECT>
-```
-
-
-# 2. Create K8s secrets
-```bash
-kubectl create secret docker-registry nvcr-secret \
-  --docker-server=nvcr.io --docker-username='$oauthtoken' --docker-password='<NGC_KEY>'
-kubectl create secret generic wandb-api-key \
-  --from-literal=WANDB_API_KEY=<YOUR_WANDB_API_KEY>
-```
-
-# 3. Launch sweep (8× L40 GPUs)
-```bash
-kubectl apply -f groot-bc-unitree-g1.yaml
-```
-
-# 4. Launch eval (2× L40 GPUs)
-```bash
-kubectl apply -f groot-isaaclab-eval.yaml
-```
-
-# 5. Check Logs
-```bash
-kubectl get pods
-kubectl logs groot-bc-g1-0 --tail=20
-```
-
-Expected end-to-end runtime: ~1 day on 10× L40 GPUs (sweep + eval).
-
----
-
 # Architecture Overview
 
 The pipeline has two stages that run on separate pods. Running both concurrently requires **10× L40 GPUs** (8 for training + 2 for eval). If your cluster has fewer GPUs, you can run the stages sequentially — complete the BC sweep first, then tear it down and launch eval.
@@ -176,6 +136,30 @@ Grab the `Full Name` for these artifacts. We will need to map these in our scrip
 
 # Running the Pipeline
 
+**Before applying**, update both YAML files with your W&B entity, project, and artifact names. The values to change:
+
+In `groot-bc-unitree-g1.yaml` (lines 843–857):
+```yaml
+- name: WANDB_ENTITY
+  value: <YOUR_WANDB_ENTITY>        # line 844
+- name: WANDB_PROJECT
+  value: <YOUR_WANDB_PROJECT>       # line 846
+- name: BASE_VLA_ARTIFACT
+  value: <ENTITY/PROJECT/groot-n1.6-3b:v1>          # line 855
+- name: DATASET_ARTIFACT
+  value: <ENTITY/PROJECT/groot-teleop-unitree-g1:v0> # line 857
+```
+
+In `groot-isaaclab-eval.yaml` (lines 1655–1658):
+```yaml
+- name: WANDB_ENTITY
+  value: <YOUR_WANDB_ENTITY>        # line 1656
+- name: WANDB_PROJECT
+  value: <YOUR_WANDB_PROJECT>       # line 1658
+```
+
+Use the artifact `Full Name` from your W&B project (see [Base Model & Teleop Dataset](#base-model--teleop-dataset)).
+
 ## Stage 1: Setup Hyperparameter Sweep for VLA Finetuning
 
 Launches a Bayesian hyperparameter sweep that fine-tunes GR00T on G1 teleop data.
@@ -194,9 +178,11 @@ This creates a single pod (`groot-bc-g1-0`) with 8× L40 GPUs running DDP traini
 
 Each trial:
 1. Fine-tunes GR00T N1.6-3B with LoRA (PEFT) for memory efficiency during training
-2. Saves fully merged weight checkpoints (not adapter-only) — this ensures the eval pod can load each checkpoint directly via `Gr00tPolicy` without needing to download the 15 GB base model separately
+2. Saves fully merged weight checkpoints (not adapter-only) — this ensures the eval pod can load each checkpoint directly later
 3. Logs training loss to W&B
 4. Uploads the best checkpoint as artifact `groot-bc-g1-trial`
+
+Expected end-to-end runtime: ~1 day on 10× L40 GPUs (sweep only).
 
 ## Stage 2: Isaac Lab Closed-Loop Evaluation
 
@@ -296,19 +282,6 @@ kubectl delete -f groot-isaaclab-eval.yaml
 kubectl scale statefulset groot-bc-g1 --replicas=0
 kubectl scale statefulset groot-isaaclab-eval --replicas=0
 ```
-
----
-
-# Files
-
-| File | Description |
-|------|-------------|
-| [`groot-bc-unitree-g1.yaml`](groot-bc-unitree-g1.yaml) | BC sweep training (8× L40) |
-| [`groot-isaaclab-eval.yaml`](groot-isaaclab-eval.yaml) | Isaac Lab closed-loop eval (2× L40) |
-| [`upload_inputs.py`](upload_inputs.py) | Download model & dataset from HuggingFace, upload to W&B |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Technical deep-dive: model internals, joint mapping, eval loop |
-
----
 
 # Troubleshooting
 
