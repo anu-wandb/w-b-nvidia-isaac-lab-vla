@@ -8,14 +8,15 @@ Deep technical documentation for the GR00T BC + Isaac Lab evaluation pipeline. F
 
 1. `wandb.agent` starts a Bayesian sweep
 2. Each trial runs `launch_finetune.py` from the Isaac-GR00T repo
-3. Training uses DDP across 8 GPUs with gradient checkpointing
+3. Training uses LoRA (PEFT) for memory efficiency with DDP across 8 GPUs and gradient checkpointing
 4. The `flash_attn` library is patched to use `sdpa` (L40 GPUs lack flash_attn_2)
-5. Best checkpoint is uploaded as a W&B artifact
+5. `launch_finetune.py` saves **fully merged weight checkpoints** (sharded `.safetensors` files), not adapter-only files — this means each checkpoint is self-contained and can be loaded directly without the base model
+6. Best checkpoint is uploaded as a W&B artifact (`groot-bc-g1-trial`)
 
 ## Evaluation Pipeline
 
 1. Eval container polls W&B for new `groot-bc-g1-trial` artifacts
-2. Downloads the checkpoint and loads `Gr00tPolicy`
+2. Downloads the checkpoint and loads it directly via `Gr00tPolicy(model_path=...)` — no base model needed since checkpoints contain merged weights
 3. For each episode:
    - Sim resets the environment (G1 robot + table + cube)
    - At each step: `obs → G1JointMapper.obs_to_groot() → policy.get_action() → G1JointMapper.action_chunk_from_groot(actions, current_proprio) → sim.step()`

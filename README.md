@@ -26,24 +26,34 @@ This setup supports:
 
 # Quickstart
 
-```bash
+
 # 1. Upload base model + dataset to W&B
+```bash
 pip install wandb huggingface_hub
 python upload_inputs.py --entity <YOUR_WANDB_ENTITY> --project <YOUR_WANDB_PROJECT>
+```
+
 
 # 2. Create K8s secrets
+```bash
 kubectl create secret docker-registry nvcr-secret \
   --docker-server=nvcr.io --docker-username='$oauthtoken' --docker-password='<NGC_KEY>'
 kubectl create secret generic wandb-api-key \
   --from-literal=WANDB_API_KEY=<YOUR_WANDB_API_KEY>
+```
 
-# 3. Launch BC sweep (8× L40 GPUs)
+# 3. Launch sweep (8× L40 GPUs)
+```bash
 kubectl apply -f groot-bc-unitree-g1.yaml
+```
 
 # 4. Launch eval (2× L40 GPUs)
+```bash
 kubectl apply -f groot-isaaclab-eval.yaml
+```
 
-# 5. Monitor
+# 5. Check Logs
+```bash
 kubectl get pods
 kubectl logs groot-bc-g1-0 --tail=20
 ```
