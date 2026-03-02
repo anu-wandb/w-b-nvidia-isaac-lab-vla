@@ -28,16 +28,16 @@ The pipeline has two stages that run on separate pods. Running both concurrently
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                     BC Sweep Training Pod                          │
-│                     groot-bc-g1-0 (8× L40)                        │
+│                     BC Sweep Training Pod                           │
+│                     groot-bc-g1-0 (8× L40)                          │
 │                                                                     │
 │  wandb.agent (Bayesian sweep)                                       │
-│    ├── Trial 1: lr=1.09e-4, grad_accum=64, steps=20000             │
-│    ├── Trial 2: lr=2.3e-4,  grad_accum=32, steps=15000             │
+│    ├── Trial 1: lr=1.09e-4, grad_accum=64, steps=20000              │
+│    ├── Trial 2: lr=2.3e-4,  grad_accum=32, steps=15000              │
 │    └── ...                                                          │
 │                                                                     │
 │  Each trial:                                                        │
-│    1. Fine-tune GR00T N1.6-3B on 311 G1 teleop episodes            │
+│    1. Fine-tune GR00T N1.6-3B on 311 G1 teleop episodes             │
 │    2. Upload best checkpoint as W&B artifact (groot-bc-g1-trial)    │
 └────────────────────────┬────────────────────────────────────────────┘
                          │ W&B Artifacts
@@ -46,18 +46,18 @@ The pipeline has two stages that run on separate pods. Running both concurrently
 │               Isaac Lab Evaluation Pod                              │
 │               groot-isaaclab-eval-0 (2× L40)                        │
 │                                                                     │
-│  ┌──────────────────┐    gRPC    ┌────────────────────────┐         │
-│  │  Sim Container   │◄─────────►│   Eval Container       │         │
-│  │  (Isaac Lab 2.3.2)│  :7000    │   (GR00T + eval)       │         │
-│  │                  │            │                        │         │
-│  │  G1 robot        │  obs/act   │  Poll W&B for new      │         │
-│  │  + table + cube  │◄──────────►│  groot-bc-g1-trial     │         │
-│  │  + camera        │            │  artifacts             │         │
-│  │                  │            │                        │         │
-│  │  JointPosition   │            │  Load GR00T policy     │         │
-│  │  ActionCfg       │            │  Run 3 rollout eps     │         │
-│  │                  │            │  Log videos to W&B     │         │
-│  └──────────────────┘            └────────────────────────┘         │
+│  ┌────────────────────┐    gRPC    ┌────────────────────────┐       │
+│  │  Sim Container     │◄──────────►│  Eval Container        │       │
+│  │  (Isaac Lab 2.3.2) │  :7000     │  (GR00T + eval)        │       │
+│  │                    │            │                        │       │
+│  │  G1 robot          │  obs/act   │  Poll W&B for new      │       │
+│  │  + table + cube    │◄──────────►│  groot-bc-g1-trial     │       │
+│  │  + camera          │            │  artifacts             │       │
+│  │                    │            │                        │       │
+│  │  JointPosition     │            │  Load GR00T policy     │       │
+│  │  ActionCfg         │            │  Run 3 rollout eps     │       │
+│  │                    │            │  Log videos to W&B     │       │
+│  └────────────────────┘            └────────────────────────┘       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
