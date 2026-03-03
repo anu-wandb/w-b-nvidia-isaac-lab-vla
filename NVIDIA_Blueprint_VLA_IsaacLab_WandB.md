@@ -18,8 +18,8 @@ Access the [GitHub Repo](https://github.com/anu-wandb/w-b-nvidia-isaac-lab-vla)
 
 ## Overview
 
-This blueprint demonstrates how robotics teams can fine-tune Vision
-Language Action (VLA) models and leverage NVIDIA Isaac Lab for
+This blueprint demonstrates how robotics teams can fine-tune [Vision
+Language Action (VLA)](https://research.nvidia.com/labs/gear/gr00t-n1_5/) models and leverage NVIDIA Isaac Lab for
 high-fidelity, simulation-based rollouts to accelerate research and
 development.
 
@@ -29,19 +29,18 @@ It delivers a production-ready architecture for:
 -   Automated checkpoint evaluation
 -   Scalable simulation workflows
 
-The entire lifecycle---from hyperparameter sweeps and artifact
-versioning to rollout metrics and video logging---is unified in Weights
-& Biases (W&B), accelerating the sim-to-real development loop and
+The entire lifecycle from hyperparameter sweeps and artifact
+versioning to rollout metrics and video logging is unified in[Weights & Biases (W&B)](https://wandb.ai/site/), accelerating the sim-to-real development loop and
 providing a centralized, reproducible system of record for model
 development at scale.
 
 ## What You'll Build
 
-A distributed VLA fine-tuning system for Behavioral Cloning (BC) that:
+A distributed VLA fine-tuning system for [Behavioral Cloning (BC)](https://arxiv.org/abs/2407.15007) that:
 
 -   Adapts a pretrained foundation model to a specific robot embodiment
--   Uses large-scale teleoperation data (human-operated robot
-    demonstrations)
+-   [Uses large-scale teleoperation data (human-operated robot
+    demonstrations)](https://www.automate.org/robotics/industry-insights/teleoperation-is-a-powerful-tool-for-humanoid-robots-but-transparency-is-key)
 -   Automatically versions model artifacts
 -   Evaluates every checkpoint in Isaac Lab using high-fidelity
     simulation rollouts
@@ -111,9 +110,9 @@ Containers communicate locally via gRPC.
 Artifacts logged in W&B serve as the bridge between pods, enabling
 decoupled training and evaluation with full lineage tracking.
 
-We recommend using RTX-enabled NVIDIA GPUs such as RTX 6000 Pro or L40
+* We recommend using RTX-enabled NVIDIA GPUs such as RTX 6000 Pro or L40
 for rendering high-fidelity simulation videos alongside training and
-rollout metrics.
+rollout metrics. *
 
 All environments run in containerized runtimes (via NVIDIA NGC) and
 scale horizontally across multi-node GPU workers.
@@ -143,7 +142,7 @@ Foundation Model → Fine-Tune → Version Artifact → Simulate → Log → Com
 
 ## 3. Experiment Tracking & Model Lifecycle (W&B)
 
-All training and evaluation outputs stream to Weights & Biases.
+All training and evaluation outputs stream to [Weights & Biases (W&B)](https://wandb.ai/site/models/).
 
 W&B captures:
 
@@ -177,11 +176,9 @@ Weights & Biases provides a unified experiment control plane synchronizing metri
 
 WandB SDK offers an out-of-the-box integration with IsaacLab, allowing your teams to capture all of this data by simply passing your `WANDB_API_KEY` and target project information for your W&B environment.
 
-## Observability
-
 Training is monitored centrally through Weights & Biases Workspace, where metrics, system telemetry, simulation videos, and checkpoints are visualized in real time. Teams can define alerts on key signals such as reward thresholds, loss divergence, or system utilization to proactively monitor training health as workloads scale.
 
-Beyond live monitoring, W&B Reports (see example auto-generated report here) enable teams to create shareable, structured summaries of experiments, combining charts, rollout videos, configurations, and analysis in a single collaborative document. This makes it easy to review results, compare runs, communicate findings across teams, and maintain a durable record of research progress.
+Beyond live monitoring, W&B Reports ([see example auto-generated report here](https://github.com/anu-wandb/robotics_automation_demo/blob/main/scripts/generate_wandb_report.py)) enable teams to create shareable, structured summaries of experiments, combining charts, rollout videos, configurations, and analysis in a single collaborative document. This makes it easy to review results, compare runs, communicate findings across teams, and maintain a durable record of research progress.
 
 Together, dashboards, alerts, and reports provide continuous visibility from experiment execution to results dissemination.
 
