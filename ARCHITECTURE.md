@@ -15,14 +15,16 @@ Deep technical documentation for the GR00T BC + Isaac Lab evaluation pipeline. F
 
 ## Evaluation Pipeline
 
-1. Eval container polls W&B for new `groot-bc-g1-trial` artifacts
+1. Eval container polls W&B every 60 seconds for new `groot-bc-g1-trial` artifact versions
 2. Downloads the checkpoint and loads it directly via `Gr00tPolicy(model_path=...)` — no base model needed since checkpoints contain merged weights
-3. For each episode:
+3. Runs 3 rollout episodes (3000 steps each) per checkpoint:
    - Sim resets the environment (G1 robot + table + cube)
+   - The language prompt is `"Pick up the apple and place it on the plate"` (matches teleop training data; the sim uses a cube as a stand-in object)
    - At each step: `obs → G1JointMapper.obs_to_groot() → policy.get_action() → G1JointMapper.action_chunk_from_groot(actions, current_proprio) → sim.step()`
    - The mapper handles the RELATIVE/ABSOLUTE action split: arm and leg deltas are added to current joint positions before being sent as absolute targets
    - Camera frames are collected for video
 4. Videos and metrics are logged back to the original sweep trial's W&B run
+5. Re-evaluating checkpoints is safe — metrics are logged with the checkpoint name and will not overwrite previous results
 
 ## GR00T Model Details
 
