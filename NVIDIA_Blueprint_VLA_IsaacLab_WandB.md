@@ -30,7 +30,7 @@ It delivers a production-ready architecture for:
 -   Scalable simulation workflows
 
 The entire lifecycle from hyperparameter sweeps and artifact
-versioning to rollout metrics and video logging is unified in[Weights & Biases (W&B)](https://wandb.ai/site/), accelerating the sim-to-real development loop and
+versioning to rollout metrics and video logging is unified in [Weights & Biases (W&B)](https://wandb.ai/site/), accelerating the sim-to-real development loop and
 providing a centralized, reproducible system of record for model
 development at scale.
 
