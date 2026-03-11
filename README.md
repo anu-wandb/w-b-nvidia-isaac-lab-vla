@@ -101,9 +101,29 @@ kubectl create secret docker-registry nvcr-secret \
 
 Create a [W&B account](https://wandb.ai) and generate an [API key](https://wandb.ai/authorize).
 
+Store your API key and entity (your W&B team name) as Kubernetes secrets:
+
 ```bash
 kubectl create secret generic wandb-api-key \
   --from-literal=WANDB_API_KEY=<YOUR_WANDB_API_KEY>
+
+kubectl create secret generic wandb-entity \
+  --from-literal=WANDB_ENTITY=<YOUR_WANDB_TEAM_NAME>
+```
+
+Referenced in YAML as:
+
+```yaml
+- name: WANDB_API_KEY
+  valueFrom:
+    secretKeyRef:
+      name: wandb-api-key
+      key: WANDB_API_KEY
+- name: WANDB_ENTITY
+  valueFrom:
+    secretKeyRef:
+      name: wandb-entity
+      key: WANDB_ENTITY
 ```
 
 ## Base Model & Teleop Dataset
@@ -135,30 +155,6 @@ Grab the `Full Name` for these artifacts. We will need to map these in our scrip
 ---
 
 # Running the Pipeline
-
-**Before applying**, update both YAML files with your W&B entity, project, and artifact names. The values to change:
-
-In `groot-bc-unitree-g1.yaml` (lines 843–857):
-```yaml
-- name: WANDB_ENTITY
-  value: <YOUR_WANDB_ENTITY>        # line 844
-- name: WANDB_PROJECT
-  value: <YOUR_WANDB_PROJECT>       # line 846
-- name: BASE_VLA_ARTIFACT
-  value: <ENTITY/PROJECT/groot-n1.6-3b:v1>          # line 855
-- name: DATASET_ARTIFACT
-  value: <ENTITY/PROJECT/groot-teleop-unitree-g1:v0> # line 857
-```
-
-In `groot-isaaclab-eval.yaml` (lines 1655–1658):
-```yaml
-- name: WANDB_ENTITY
-  value: <YOUR_WANDB_ENTITY>        # line 1656
-- name: WANDB_PROJECT
-  value: <YOUR_WANDB_PROJECT>       # line 1658
-```
-
-Use the artifact `Full Name` from your W&B project (see [Base Model & Teleop Dataset](#base-model--teleop-dataset)).
 
 ## Stage 1: Setup Hyperparameter Sweep for VLA Finetuning
 
@@ -250,7 +246,7 @@ kubectl logs groot-isaaclab-eval-0 -c eval --tail=20
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WANDB_ENTITY` | `wandb-smle` | W&B entity |
+| `WANDB_ENTITY` | *(from secret)* | W&B team name (set in `wandb-entity` secret) |
 | `WANDB_PROJECT` | `isaacsim-nvidia-vla-crwv` | W&B project |
 | `BASE_VLA_ARTIFACT` | `groot-n1.6-3b:v1` | Base GR00T model |
 | `DATASET_ARTIFACT` | `groot-teleop-unitree-g1:v0` | Teleop training data |

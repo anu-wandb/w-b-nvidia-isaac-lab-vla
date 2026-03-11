@@ -7,10 +7,10 @@
 # (diffusion) action head.
 #
 # Dataset: nvidia/PhysicalAI-Robotics-GR00T-Teleop-G1 (311 episodes, g1-pick-apple)
-#   - W&B artifact: wandb-smle/isaacsim-nvidia-vla-crwv/groot-teleop-unitree-g1:v0
+#   - W&B artifact: {WANDB_ENTITY}/{WANDB_PROJECT}/groot-teleop-unitree-g1:v0
 #
 # Model: GR00T N1.6-3B
-#   - W&B artifact: wandb-smle/isaacsim-nvidia-vla-crwv/groot-n1.6-3b:v1
+#   - W&B artifact: {WANDB_ENTITY}/{WANDB_PROJECT}/groot-n1.6-3b:v1
 #
 # Pipeline:
 #   1. Download dataset + base model from W&B artifacts
@@ -134,8 +134,12 @@ data:
     import wandb
 
     def main():
-        model_artifact_ref = os.environ["BASE_VLA_ARTIFACT"]
-        dataset_artifact_ref = os.environ["DATASET_ARTIFACT"]
+        entity = os.environ["WANDB_ENTITY"]
+        project = os.environ.get("WANDB_PROJECT", "isaacsim-nvidia-vla-crwv")
+        base_name = os.environ.get("BASE_VLA_ARTIFACT", "groot-n1.6-3b:v1")
+        dataset_name = os.environ.get("DATASET_ARTIFACT", "groot-teleop-unitree-g1:v0")
+        model_artifact_ref = f"{entity}/{project}/{base_name}"
+        dataset_artifact_ref = f"{entity}/{project}/{dataset_name}"
 
         ts = datetime.now().strftime("%m-%d-%H-%M")
         run_name = f"gr00t-finetune-{ts}"
@@ -582,7 +586,7 @@ data:
         config = wandb.config
 
         # Log input artifacts (base model + dataset) so W&B graph shows lineage
-        entity = os.environ.get("WANDB_ENTITY", "wandb-smle")
+        entity = os.environ.get("WANDB_ENTITY")
         project = os.environ.get("WANDB_PROJECT", "isaacsim-nvidia-vla-crwv")
         try:
             run.use_artifact(f"{entity}/{project}/groot-n1.6-3b:latest", type="model")
@@ -840,21 +844,23 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             # ---- W&B ----
-            - name: WANDB_ENTITY
-              value: wandb-smle
-            - name: WANDB_PROJECT
-              value: isaacsim-nvidia-vla-crwv
-            # Run name format: gr00t-finetune-MM-DD-HH-MM (set in download_artifacts.py)
             - name: WANDB_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: wandb-api-key
                   key: WANDB_API_KEY
+            - name: WANDB_ENTITY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-entity
+                  key: WANDB_ENTITY
+            - name: WANDB_PROJECT
+              value: isaacsim-nvidia-vla-crwv
             # ---- Artifacts ----
             - name: BASE_VLA_ARTIFACT
-              value: wandb-smle/isaacsim-nvidia-vla-crwv/groot-n1.6-3b:v1
+              value: groot-n1.6-3b:v1
             - name: DATASET_ARTIFACT
-              value: wandb-smle/isaacsim-nvidia-vla-crwv/groot-teleop-unitree-g1:v0
+              value: groot-teleop-unitree-g1:v0
             # ---- Training / Sweep ----
             - name: EMBODIMENT_TAG
               value: NEW_EMBODIMENT

@@ -1098,7 +1098,7 @@ data:
     from g1_joint_mapper import G1JointMapper, RELATIVE_PARTS, ABSOLUTE_PARTS
 
     # ---- Configuration ----
-    ENTITY = os.environ.get("WANDB_ENTITY", "wandb-smle")
+    ENTITY = os.environ.get("WANDB_ENTITY")
     PROJECT = os.environ.get("WANDB_PROJECT", "isaacsim-nvidia-vla-crwv")
     N_EPISODES = int(os.environ.get("N_EPISODES", "10"))
     MAX_STEPS = int(os.environ.get("MAX_EPISODE_STEPS", "500"))
@@ -1652,15 +1652,18 @@ spec:
             - name: SIM_RPC_ADDR
               value: 127.0.0.1:7000
             # ---- W&B ----
-            - name: WANDB_ENTITY
-              value: wandb-smle
-            - name: WANDB_PROJECT
-              value: isaacsim-nvidia-vla-crwv
             - name: WANDB_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: wandb-api-key
                   key: WANDB_API_KEY
+            - name: WANDB_ENTITY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-entity
+                  key: WANDB_ENTITY
+            - name: WANDB_PROJECT
+              value: isaacsim-nvidia-vla-crwv
             # ---- Eval Config ----
             - name: N_EPISODES
               value: "3"
