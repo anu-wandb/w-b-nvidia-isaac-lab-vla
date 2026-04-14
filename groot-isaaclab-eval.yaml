@@ -54,7 +54,7 @@ data:
     from isaaclab.app import AppLauncher
     parser = argparse.ArgumentParser(description="Isaac Lab Sim Server - G1 Eval")
     AppLauncher.add_app_launcher_args(parser)
-    args = parser.parse_args(["--headless", "--enable_cameras"])
+    args = parser.parse_args(["--viz", "none", "--enable_cameras"])
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
@@ -66,6 +66,7 @@ data:
     import gymnasium as gym
     from gymnasium.wrappers import RecordVideo
     import torch
+    import warp as wp
 
     # Register Isaac Lab tasks
     import isaaclab_tasks  # noqa: F401
@@ -81,7 +82,9 @@ data:
     from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
     def _to_cpu(obj):
-        """Recursively move tensors to CPU/numpy for serialization."""
+        """Recursively move tensors/warp arrays to CPU/numpy for serialization."""
+        if isinstance(obj, wp.array):
+            return wp.to_torch(obj).detach().cpu().numpy()
         if isinstance(obj, torch.Tensor):
             return obj.detach().cpu().numpy()
         if isinstance(obj, dict):
@@ -97,6 +100,8 @@ data:
         return pickle.loads(buf)
 
     def _as_np(x):
+        if isinstance(x, wp.array):
+            return wp.to_torch(x).detach().cpu().numpy()
         if isinstance(x, torch.Tensor):
             return x.detach().cpu().numpy()
         return np.asarray(x)
@@ -201,7 +206,7 @@ data:
             for k, v in obs.items():
                 if isinstance(v, dict):
                     result[k] = {kk: _as_np(vv).astype(np.float32) for kk, vv in v.items()}
-                elif isinstance(v, (torch.Tensor, np.ndarray)):
+                elif isinstance(v, (wp.array, torch.Tensor, np.ndarray)):
                     result[k] = _as_np(v).astype(np.float32)
                 else:
                     try:
@@ -1609,7 +1614,7 @@ spec:
       containers:
         # ---- Isaac Lab Simulation Container ----
         - name: sim
-          image: nvcr.io/nvidia/isaac-lab:2.3.2
+          image: nvcr.io/nvidia/isaac-lab:3.0.0-beta1
           command: ["/bin/bash", "/scripts/sim_entrypoint.sh"]
           env:
             - name: POD_NAME

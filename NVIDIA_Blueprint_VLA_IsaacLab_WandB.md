@@ -187,7 +187,7 @@ Together, dashboards, alerts, and reports provide continuous visibility from exp
 ## References
 
 -   [Isaac Lab GitHub](https://github.com/isaac-sim/IsaacLab)
--   [Isaac Sim Documentation](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/index.html)
+-   [Isaac Sim Documentation](https://docs.isaacsim.omniverse.nvidia.com/6.0.0/index.html)
 -   [Isaac-GR00T Documentation](https://github.com/NVIDIA/Isaac-GR00T)
 -   [Weights & Biases Documentation](https://docs.wandb.ai/)
 -   [Kubernetes Documentation](https://kubernetes.io/docs/)

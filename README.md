@@ -48,7 +48,7 @@ The pipeline has two stages that run on separate pods. Running both concurrently
 │                                                                     │
 │  ┌────────────────────┐    gRPC    ┌────────────────────────┐       │
 │  │  Sim Container     │◄──────────►│  Eval Container        │       │
-│  │  (Isaac Lab 2.3.2) │  :7000     │  (GR00T + eval)        │       │
+│  │  (Isaac Lab 3.0.0) │  :7000     │  (GR00T + eval)        │       │
 │  │                    │            │                        │       │
 │  │  G1 robot          │  obs/act   │  Poll W&B for new      │       │
 │  │  + table + cube    │◄──────────►│  groot-bc-g1-trial     │       │
@@ -63,7 +63,7 @@ The pipeline has two stages that run on separate pods. Running both concurrently
 
 ### Key Design Decisions
 
-- **Two-container pods**: Isaac Lab requires Python 3.11 (bundled in `nvcr.io/nvidia/isaac-lab:2.3.2`), while GR00T requires Python 3.10. The containers share a pod and communicate over localhost gRPC.
+- **Two-container pods**: Isaac Lab requires Python 3.12 (bundled in `nvcr.io/nvidia/isaac-lab:3.0.0-beta1`), while GR00T requires Python 3.10. The containers share a pod and communicate over localhost gRPC.
 - **Fixed-base robot**: The G1 robot's root link is fixed (`fix_root_link = True`) for tabletop manipulation evaluation.
 - **Joint position control**: GR00T outputs per-body-part joint positions/deltas, which are mapped to Isaac Lab's flat 37-DOF action space via `G1JointMapper`.
 - **RELATIVE vs ABSOLUTE actions**: Arms and legs use relative (delta) actions, while waist and hands use absolute targets. The mapper converts relative deltas to absolute positions by adding them to the current joint state.
@@ -88,7 +88,7 @@ kubectl config use-context <your-cluster-context>
 
 ## NVIDIA NGC Access
 
-Create an [NGC account](https://ngc.nvidia.com) and generate an API key. The pipeline uses container image `nvcr.io/nvidia/isaac-lab:2.3.2`.
+Create an [NGC account](https://ngc.nvidia.com) and generate an API key. The pipeline uses container image `nvcr.io/nvidia/isaac-lab:3.0.0-beta1`.
 
 ```bash
 kubectl create secret docker-registry nvcr-secret \
