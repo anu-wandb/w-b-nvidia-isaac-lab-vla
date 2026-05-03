@@ -54,7 +54,7 @@ data:
     from isaaclab.app import AppLauncher
     parser = argparse.ArgumentParser(description="Isaac Lab Sim Server - G1 Eval")
     AppLauncher.add_app_launcher_args(parser)
-    args = parser.parse_args(["--viz", "none", "--enable_cameras"])
+    args = parser.parse_args(["--headless", "--enable_cameras"])
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
@@ -64,7 +64,6 @@ data:
     import numpy as np
     import grpc
     import gymnasium as gym
-    from gymnasium.wrappers import RecordVideo
     import torch
     import warp as wp
 
@@ -106,11 +105,13 @@ data:
             return x.detach().cpu().numpy()
         return np.asarray(x)
 
-    def make_env(task_name: str, video_dir: str, video_every: int):
+    def make_env(task_name: str):
         env_cfg = parse_env_cfg(task_name, device="cuda:0", num_envs=1)
         env_cfg.scene.num_envs = 1
-        env = gym.make(task_name, cfg=env_cfg, render_mode="rgb_array")
-        # Don't wrap with RecordVideo — eval client records frames via gRPC
+        # render_mode=None: we read frames directly from the CameraCfg scene sensor.
+        # sim.render() is still called in env.step() because has_rtx_sensors() is True
+        # when --enable_cameras is set and a CameraCfg sensor exists in the scene.
+        env = gym.make(task_name, cfg=env_cfg, render_mode=None)
         return env
 
     def extract_proprio(obs):
@@ -190,11 +191,23 @@ data:
             return _serialize({"ok": True})
 
     def _render_frame(env):
-        """Get a camera frame from the env."""
+        """Read frame from the CameraCfg scene sensor (updated during env.step via scene.update)."""
         try:
-            frame = env.render()
-            if frame is not None:
-                return _as_np(frame)
+            camera = env.unwrapped.scene.sensors.get("camera")
+            if camera is not None and camera.data is not None and camera.data.output is not None:
+                rgb = camera.data.output.get("rgb")
+                if rgb is not None:
+                    if hasattr(rgb, 'cpu'):
+                        rgb = rgb.cpu().numpy()
+                    rgb = np.asarray(rgb)
+                    if rgb.ndim == 4:
+                        frame = rgb[0, ..., :3].astype(np.uint8)
+                    elif rgb.ndim == 3:
+                        frame = rgb[..., :3].astype(np.uint8)
+                    else:
+                        return None
+                    print(f"[SIM] frame shape={frame.shape} min={frame.min()} max={frame.max()} std={frame.std():.1f}")
+                    return frame
         except Exception as e:
             print(f"[SIM] WARN render: {e}")
         return None
@@ -274,12 +287,8 @@ data:
 
     def serve():
         task = os.environ.get("ISAAC_TASK", "Isaac-G1-ManipJointCtrl-v0")
-        video_every = int(os.environ.get("VIDEO_EVERY", "1"))
-        video_dir = os.environ.get("VIDEO_DIR", "/shared/videos") + "/" + os.environ.get("POD_NAME", "pod")
-        os.makedirs(video_dir, exist_ok=True)
-
         print(f"[SIM] Creating environment: {task}")
-        env = make_env(task, video_dir, video_every)
+        env = make_env(task)
         joint_names = extract_joint_names(env)
         print(f"[SIM] Joint names ({len(joint_names)}): {joint_names}")
 
@@ -340,14 +349,14 @@ data:
     Registers: Isaac-G1-ManipJointCtrl-v0
     """
     import gymnasium as gym
-    import math
 
     from isaaclab.utils import configclass
     import isaaclab.sim as sim_utils
     from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
     from isaaclab.envs import ManagerBasedRLEnvCfg
-    from isaaclab.managers import ObservationGroupCfg, ObservationTermCfg, RewardTermCfg, TerminationTermCfg
+    from isaaclab.managers import ObservationGroupCfg, ObservationTermCfg, TerminationTermCfg
     from isaaclab.scene import InteractiveSceneCfg
+    from isaaclab.sensors import CameraCfg
     import isaaclab.envs.mdp as mdp
 
     # Import G1 robot asset config — need full 37-DOF version with hands + torso
@@ -450,6 +459,30 @@ data:
             prim_path="{ENV_REGEX_NS}/Robot",
         )
 
+        # Side-view camera at (2, 0, 1.5) looking toward robot at (0, 0, 0.9).
+        # Quaternion (w=0.567, x=0.422, y=0.422, z=0.567) was computed for
+        # OpenGL convention (camera local -Z = look direction, local +Y = up).
+        # Must use convention="opengl" to match — "world" would mis-apply a
+        # second coordinate conversion and produce the wrong orientation.
+        camera: CameraCfg = CameraCfg(
+            prim_path="{ENV_REGEX_NS}/EvalCamera",
+            update_period=0.0,
+            height=480,
+            width=640,
+            data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=24.0,
+                focus_distance=400.0,
+                horizontal_aperture=20.955,
+                clipping_range=(0.1, 1.0e5),
+            ),
+            offset=CameraCfg.OffsetCfg(
+                pos=(2.0, 0.0, 1.5),
+                rot=(0.567, 0.422, 0.422, 0.567),
+                convention="opengl",
+            ),
+        )
+
         def __post_init__(self):
             """Fix the robot's root link so it doesn't fall over."""
             self.robot.spawn.articulation_props.fix_root_link = True
@@ -525,9 +558,6 @@ data:
             self.sim.dt = 0.005  # 200 Hz physics
             self.decimation = 4  # 50 Hz control
             self.sim.render_interval = self.decimation
-            # Viewer camera: front-right angle showing robot + table
-            self.viewer.eye = (1.5, -0.5, 1.2)
-            self.viewer.lookat = (0.0, 0.5, 0.6)
 
     ##
     # Register with Gymnasium
@@ -575,7 +605,7 @@ data:
 
     # Install GR00T repo (--no-deps; flash-attn skipped)
     if [[ ! -d /workspace/Isaac-GR00T ]]; then
-      git clone --depth 1 https://github.com/NVIDIA/Isaac-GR00T /workspace/Isaac-GR00T
+      git clone --depth 1 --branch n1.6-release https://github.com/NVIDIA/Isaac-GR00T /workspace/Isaac-GR00T
     fi
     python -m pip install --no-deps -e /workspace/Isaac-GR00T
     export PYTHONPATH="/workspace/Isaac-GR00T${PYTHONPATH:+:${PYTHONPATH}}"
@@ -763,7 +793,8 @@ data:
     addr = os.environ.get("SIM_RPC_ADDR", "127.0.0.1:7000")
     channel = grpc.insecure_channel(addr)
     health = channel.unary_unary("/SimService/Health", request_serializer=ser, response_deserializer=deser)
-    for i in range(180):
+    # Isaac Sim 3.0 + env creation takes ~10-15 min. Wait up to 20 min total.
+    for i in range(1200):
         try:
             resp = health({})
             if resp.get("ok"):
@@ -773,7 +804,7 @@ data:
             pass
         time.sleep(1)
     else:
-        raise RuntimeError("sim RPC not ready after 180s")
+        raise RuntimeError("sim RPC not ready after 1200s")
 
   g1_teleop_config.py: |
     """Register NEW_EMBODIMENT modality config for GR00T G1 teleop model."""
@@ -1305,7 +1336,8 @@ data:
         }
 
 
-    def eval_checkpoint(ckpt_path: str, sim: SimClient, mapper: G1JointMapper, ckpt_name: str):
+    def eval_checkpoint(ckpt_path: str, sim: SimClient, mapper: G1JointMapper, ckpt_name: str,
+                        artifact_name: str = ""):
         """Evaluate one GR00T checkpoint across N episodes."""
         import torch
 
@@ -1317,7 +1349,11 @@ data:
         )
         print(f"[eval] Policy loaded. Running {N_EPISODES} episodes...")
 
-        video_dir = VIDEO_DIR / ckpt_name
+        # Use artifact name (with version) as the video directory so filenames
+        # make it clear which artifact was evaluated (e.g. groot-bc-g1-trial:v15).
+        # Replace ':' with '_' for filesystem safety.
+        vid_label = (artifact_name or ckpt_name).replace(":", "_")
+        video_dir = VIDEO_DIR / vid_label
         results = []
 
         for ep in range(N_EPISODES):
@@ -1334,7 +1370,8 @@ data:
         return results
 
 
-    def log_to_wandb(run, ckpt_name: str, trial_name: str, results: list, metadata: dict):
+    def log_to_wandb(run, ckpt_name: str, trial_name: str, results: list, metadata: dict,
+                     artifact_name: str = ""):
         """Log evaluation results to W&B."""
         rewards = [r["total_reward"] for r in results]
         lengths = [r["episode_length"] for r in results]
@@ -1361,7 +1398,7 @@ data:
             if r["video_path"] and os.path.exists(r["video_path"]):
                 try:
                     vid = wandb.Video(r["video_path"], format="mp4", fps=20,
-                                      caption=f"{ckpt_name} ep{ep_idx}")
+                                      caption=f"sim-eval-{artifact_name or ckpt_name} ep{ep_idx}")
                     wandb.log({"eval/rollout": vid})
                 except Exception as e:
                     print(f"[eval] WARN: video upload failed for ep {ep_idx}: {e}")
@@ -1403,7 +1440,7 @@ data:
         mapper = G1JointMapper(joint_names)
 
         # Query W&B for sweep trial artifacts (retry with backoff if none found yet)
-        max_wait = int(os.environ.get("ARTIFACT_WAIT_MINUTES", "60"))
+        max_wait = int(os.environ.get("ARTIFACT_WAIT_MINUTES", "1440"))  # wait up to 24h
         poll_interval = 60  # seconds
         trial_artifacts = []
 
@@ -1447,18 +1484,23 @@ data:
                 time.sleep(3600)
             return
 
-        # Track evaluated artifacts to avoid duplicates
+        # Track evaluated artifacts to avoid duplicates.
+        # Delete stale cache on startup so all checkpoints are re-evaluated
+        # (ensures videos are recorded with the current camera/render setup).
         evaluated_file = Path("/workspace/eval_artifacts/.evaluated")
-        evaluated_set = set()
         if evaluated_file.exists():
-            evaluated_set = set(evaluated_file.read_text().strip().split("\n"))
+            evaluated_file.unlink()
+            print("[eval] Cleared evaluated cache — all checkpoints will be re-evaluated")
+        evaluated_set = set()
 
         def eval_artifacts(trial_artifacts, sim, mapper):
             """Evaluate new (unevaluated) artifacts. Returns count of newly evaluated."""
             nonlocal evaluated_set
             new_count = 0
             for i, artifact in enumerate(trial_artifacts):
-                art_key = f"{artifact.name}:{artifact.version}"
+                # artifact.name from W&B API may include ":vN" — normalise to base:version
+                art_base = artifact.name.split(":")[0]
+                art_key = f"{art_base}:{artifact.version}"
                 if art_key in evaluated_set:
                     print(f"[eval] Skipping already-evaluated: {art_key}")
                     continue
@@ -1468,12 +1510,12 @@ data:
                 best_loss = meta.get("best_loss", "N/A")
 
                 print(f"\n{'=' * 60}")
-                print(f"[eval] [{i+1}/{len(trial_artifacts)}] {artifact.name}")
+                print(f"[eval] [{i+1}/{len(trial_artifacts)}] {art_key}")
                 print(f"[eval] Trial: {trial_name}, Training loss: {best_loss}")
                 print(f"{'=' * 60}")
 
                 # Download checkpoint
-                ckpt_dir = artifact.download(root=f"/workspace/eval_artifacts/{artifact.name}")
+                ckpt_dir = artifact.download(root=f"/workspace/eval_artifacts/{art_base}")
                 model_dir = os.path.join(ckpt_dir, "model")
                 if not os.path.exists(os.path.join(model_dir, "config.json")):
                     model_dir = ckpt_dir
@@ -1488,10 +1530,11 @@ data:
                     except Exception as e:
                         print(f"[eval] Could not get source run: {e}")
 
-                # Run eval FIRST (doesn't need W&B)
-                ckpt_name = meta.get("checkpoint", artifact.name.split(":")[0])
+                ckpt_name = meta.get("checkpoint", art_base)
+                artifact_name = art_key
                 try:
-                    results = eval_checkpoint(model_dir, sim, mapper, ckpt_name)
+                    results = eval_checkpoint(model_dir, sim, mapper, ckpt_name,
+                                              artifact_name=artifact_name)
                 except Exception as e:
                     print(f"[eval] ERROR during rollout: {e}")
                     import traceback; traceback.print_exc()
@@ -1516,7 +1559,8 @@ data:
                                 job_type="isaaclab-eval",
                                 settings=wandb.Settings(init_timeout=120),
                             )
-                        log_to_wandb(run, ckpt_name, trial_name, results, meta)
+                        log_to_wandb(run, ckpt_name, trial_name, results, meta,
+                                     artifact_name=artifact_name)
                     except Exception as e:
                         print(f"[eval] WARN: W&B logging failed: {e}")
                         print(f"[eval] Videos saved locally at /shared/eval_videos/{ckpt_name}/")
@@ -1532,7 +1576,7 @@ data:
                 evaluated_file.write_text("\n".join(sorted(evaluated_set)))
 
                 # Clean up downloaded artifact
-                shutil.rmtree(f"/workspace/eval_artifacts/{artifact.name}", ignore_errors=True)
+                shutil.rmtree(f"/workspace/eval_artifacts/{art_base}", ignore_errors=True)
                 new_count += 1
             return new_count
 
@@ -1623,10 +1667,6 @@ spec:
                   fieldPath: metadata.name
             - name: ISAAC_TASK
               value: Isaac-G1-ManipJointCtrl-v0
-            - name: VIDEO_EVERY
-              value: "1"
-            - name: VIDEO_DIR
-              value: /shared/videos
             - name: SIM_RPC_PORT
               value: "7000"
           resources:
@@ -1668,7 +1708,7 @@ spec:
                   name: wandb-entity
                   key: WANDB_ENTITY
             - name: WANDB_PROJECT
-              value: isaacsim-nvidia-vla-crwv
+              value: vla-finetune-isaac-3
             # ---- Eval Config ----
             - name: N_EPISODES
               value: "3"

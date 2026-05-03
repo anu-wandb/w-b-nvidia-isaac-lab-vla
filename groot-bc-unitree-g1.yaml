@@ -69,7 +69,7 @@ data:
 
     # ---- Clone + install Isaac-GR00T ----
     if [[ ! -d /workspace/Isaac-GR00T ]]; then
-      git clone --depth 1 https://github.com/NVIDIA/Isaac-GR00T /workspace/Isaac-GR00T
+      git clone --depth 1 --branch n1.6-release https://github.com/NVIDIA/Isaac-GR00T /workspace/Isaac-GR00T
     fi
     python -m pip install --no-deps -e /workspace/Isaac-GR00T
     export PYTHONPATH="/workspace/Isaac-GR00T${PYTHONPATH:+:${PYTHONPATH}}"
@@ -330,7 +330,6 @@ data:
 
     def main():
         output_dir = Path("/workspace/output")
-        dataset_dir = Path("/workspace/data/dataset")
 
         ckpts = sorted([
             d for d in output_dir.iterdir()
@@ -350,20 +349,10 @@ data:
             resume="must",
         )
 
-        video_dir = dataset_dir / "videos" / "chunk-000"
-        video_keys = sorted([d.name for d in video_dir.iterdir() if d.is_dir()])
-        vkey = video_keys[0] if video_keys else None
-        print(f"[eval] Video key: {vkey}")
-
-        info = json.loads((dataset_dir / "meta" / "info.json").read_text())
-        total_eps = info["total_episodes"]
-        eval_episodes = np.linspace(0, total_eps - 1, 5, dtype=int).tolist()
-        print(f"[eval] Eval episodes: {eval_episodes}")
+        eval_episodes = list(range(min(5, len(ckpts))))
 
         # --- Metrics table (pure data, no media) ---
-        metrics_table = wandb.Table(columns=[
-            "checkpoint", "step", "episode", "loss"
-        ])
+        metrics_table = wandb.Table(columns=["checkpoint", "step", "loss"])
 
         for ckpt in ckpts:
             step = int(ckpt.name.split("-")[-1]) if "-" in ckpt.name else 0
@@ -381,32 +370,11 @@ data:
                         ckpt_loss = round(ckpt_loss, 4)
                         print(f"[eval] {ckpt.name}: loss={ckpt_loss}")
 
-            for ep_idx in eval_episodes:
-                metrics_table.add_data(ckpt.name, step, ep_idx, ckpt_loss)
+            metrics_table.add_data(ckpt.name, step, ckpt_loss)
 
         # Log metrics table
         run.log({"eval/metrics": metrics_table})
-        print(f"[eval] Logged metrics table ({len(metrics_table.data)} rows)")
-
-        # --- Log eval videos individually to eval/ panel ---
-        video_count = 0
-        if vkey:
-            for ckpt in ckpts:
-                step = int(ckpt.name.split("-")[-1]) if "-" in ckpt.name else 0
-                for ep_idx in eval_episodes:
-                    vpath = video_dir / vkey / f"episode_{ep_idx:06d}.mp4"
-                    if not vpath.exists():
-                        continue
-                    try:
-                        key = f"eval/{ckpt.name}/episode_{ep_idx}"
-                        vid = wandb.Video(str(vpath), format="mp4", fps=info.get("fps", 30))
-                        run.log({key: vid})
-                        video_count += 1
-                    except Exception as e:
-                        print(f"[eval] WARN video {vpath.name}: {e}")
-
-        print(f"[eval] Logged {video_count} eval videos")
-        print(f"[eval] Logged eval table with {len(ckpts)} checkpoints x {len(eval_episodes)} episodes")
+        print(f"[eval] Logged metrics table ({len(metrics_table.data)} rows, {len(ckpts)} checkpoints)")
         wandb.finish()
 
     if __name__ == "__main__":
@@ -593,7 +561,7 @@ data:
         except Exception:
             pass  # artifact may not exist yet
         try:
-            run.use_artifact(f"{entity}/{project}/g1-teleop-dataset:latest", type="dataset")
+            run.use_artifact(f"{entity}/{project}/groot-teleop-unitree-g1:latest", type="dataset")
         except Exception:
             pass
 
@@ -638,10 +606,85 @@ data:
             "--warmup-ratio", str(warmup),
             "--weight-decay", str(wd),
             "--dataloader-num-workers", "6",
-            # No --use-wandb: training curves reconstructed from trainer_state.json
+            # No --use-wandb: training curves streamed live via background thread below
         ]
 
+        # Background thread: stream metrics + upload intermediate checkpoints every 60s
+        import threading
+        _stop_streamer = threading.Event()
+        _last_logged_step = [-1]
+        _uploaded_ckpts = set()
+
+        def _stream_metrics():
+            while not _stop_streamer.wait(60):
+                try:
+                    ts_files = sorted(output_dir.glob("checkpoint-*/trainer_state.json"))
+                    if not ts_files:
+                        continue
+                    state = json.loads(ts_files[-1].read_text())
+                    for entry in state.get("log_history", []):
+                        step_num = entry.get("step", 0)
+                        if step_num <= _last_logged_step[0]:
+                            continue
+                        log_data = {}
+                        if "loss" in entry:
+                            log_data["train/loss"] = entry["loss"]
+                        if "learning_rate" in entry:
+                            log_data["train/lr"] = entry["learning_rate"]
+                        if "grad_norm" in entry:
+                            log_data["train/grad_norm"] = entry["grad_norm"]
+                        if log_data:
+                            wandb.log(log_data, step=step_num)
+                            _last_logged_step[0] = step_num
+                except Exception:
+                    pass
+
+                # Upload any new intermediate checkpoints as artifacts
+                try:
+                    ckpt_dirs = sorted([
+                        d for d in output_dir.glob("checkpoint-*")
+                        if d.is_dir() and (d / "config.json").exists()
+                    ])
+                    for ckpt in ckpt_dirs:
+                        if ckpt.name in _uploaded_ckpts:
+                            continue
+                        ckpt_step = int(ckpt.name.split("-")[-1]) if "-" in ckpt.name else 0
+                        best_loss_so_far = None
+                        ts = ckpt / "trainer_state.json"
+                        if ts.exists():
+                            hist = json.loads(ts.read_text()).get("log_history", [])
+                            losses = [e["loss"] for e in hist if "loss" in e]
+                            if losses:
+                                best_loss_so_far = round(min(losses), 4)
+                        print(f"[sweep] Uploading intermediate checkpoint {ckpt.name} (step={ckpt_step}, best_loss={best_loss_so_far})")
+                        art = wandb.Artifact(
+                            "groot-bc-g1-trial",
+                            type="model",
+                            description=f"Trial {run.name}: checkpoint at step {ckpt_step}",
+                            metadata={
+                                "trial_name": run.name,
+                                "run_id": run.id,
+                                "checkpoint": ckpt.name,
+                                "checkpoint_step": ckpt_step,
+                                "max_steps": max_steps,
+                                "learning_rate": lr,
+                                "grad_accum_steps": grad_accum,
+                                "best_loss": best_loss_so_far,
+                                "intermediate": True,
+                            },
+                        )
+                        art.add_dir(str(ckpt), name="model")
+                        run.log_artifact(art).wait()
+                        _uploaded_ckpts.add(ckpt.name)
+                        print(f"[sweep] Artifact uploaded: groot-bc-g1-trial ({ckpt.name})")
+                except Exception as e:
+                    print(f"[sweep] WARN: checkpoint upload failed: {e}")
+
+        streamer = threading.Thread(target=_stream_metrics, daemon=True)
+        streamer.start()
+
         result = subprocess.run(cmd, cwd="/workspace/Isaac-GR00T")
+        _stop_streamer.set()
 
         if result.returncode != 0:
             print(f"[sweep] Training FAILED (rc={result.returncode})")
@@ -733,32 +776,6 @@ data:
             art.add_dir(str(best_ckpt), name="model")
             run.log_artifact(art).wait()
             print(f"[sweep] Uploaded artifact: groot-bc-g1-trial ({best_ckpt.name})")
-
-        # --- Log eval videos from dataset for each checkpoint ---
-        dataset_dir = Path("/workspace/data/dataset")
-        video_dir = dataset_dir / "videos" / "chunk-000"
-        if video_dir.exists():
-            video_keys = sorted([d.name for d in video_dir.iterdir() if d.is_dir()])
-            vkey = video_keys[0] if video_keys else None
-            if vkey:
-                info = json.loads((dataset_dir / "meta" / "info.json").read_text())
-                total_eps = info["total_episodes"]
-                eval_episodes = np.linspace(0, total_eps - 1, 5, dtype=int).tolist()
-                vid_count = 0
-                for ckpt in ckpts:
-                    for ep_idx in eval_episodes:
-                        vpath = video_dir / vkey / f"episode_{ep_idx:06d}.mp4"
-                        if not vpath.exists():
-                            continue
-                        try:
-                            key = f"eval/{ckpt.name}/episode_{ep_idx}"
-                            vid = wandb.Video(str(vpath), format="mp4",
-                                              fps=info.get("fps", 30))
-                            wandb.log({key: vid})
-                            vid_count += 1
-                        except Exception as e:
-                            print(f"[sweep] WARN video: {e}")
-                print(f"[sweep] Logged {vid_count} eval videos")
 
         wandb.finish()
 
@@ -855,10 +872,10 @@ spec:
                   name: wandb-entity
                   key: WANDB_ENTITY
             - name: WANDB_PROJECT
-              value: isaacsim-nvidia-vla-crwv
+              value: vla-finetune-isaac-3
             # ---- Artifacts ----
             - name: BASE_VLA_ARTIFACT
-              value: groot-n1.6-3b:v1
+              value: groot-n1.6-3b:v0
             - name: DATASET_ARTIFACT
               value: groot-teleop-unitree-g1:v0
             # ---- Training / Sweep ----
