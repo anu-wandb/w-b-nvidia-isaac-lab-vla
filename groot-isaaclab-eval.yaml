@@ -459,11 +459,10 @@ data:
             prim_path="{ENV_REGEX_NS}/Robot",
         )
 
-        # Side-view camera at (2, 0, 1.5) looking toward robot at (0, 0, 0.9).
-        # Quaternion (w=0.567, x=0.422, y=0.422, z=0.567) was computed for
-        # OpenGL convention (camera local -Z = look direction, local +Y = up).
-        # Must use convention="opengl" to match — "world" would mis-apply a
-        # second coordinate conversion and produce the wrong orientation.
+        # Side-view camera at (2.5, 0.25, 0.8) looking toward (0, 0.25, 0.6).
+        # Y=0.25 centers the view between robot (y=0) and table (y=0.55).
+        # Vertical coverage: z=-0.22m to +1.42m — full body (feet 0m, head ~1.3m) + floor.
+        # Quaternion (w=0.520, x=0.480, y=0.480, z=0.520) computed for OpenGL convention.
         camera: CameraCfg = CameraCfg(
             prim_path="{ENV_REGEX_NS}/EvalCamera",
             update_period=0.0,
@@ -477,8 +476,8 @@ data:
                 clipping_range=(0.1, 1.0e5),
             ),
             offset=CameraCfg.OffsetCfg(
-                pos=(2.0, 0.0, 1.5),
-                rot=(0.567, 0.422, 0.422, 0.567),
+                pos=(2.5, 0.25, 0.8),
+                rot=(0.520, 0.480, 0.480, 0.520),
                 convention="opengl",
             ),
         )
